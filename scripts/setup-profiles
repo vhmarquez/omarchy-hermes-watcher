@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+plugin_root="$(cd -- "$script_dir/.." && pwd -P)"
+hermes_root="${HERMES_ROOT:-$HOME/.hermes}"
+data_parent="${XDG_DATA_HOME:-$HOME/.local/share}"
+plugin_name="omarchy-bot-status"
+
+lock_path="${XDG_RUNTIME_DIR:-/tmp}/vhm-hermes-bots-${UID}.lock"
+[[ ! -L "$lock_path" && ( ! -e "$lock_path" || -f "$lock_path" ) ]] || {
+  printf 'Refusing unsafe managed lock path: %s\n' "$lock_path" >&2
+  exit 1
+}
+exec 9>>"$lock_path"
+lock_fd="/proc/$$/fd/9"
+[[ ! -L "$lock_path" && "$(stat -Lc '%d:%i' -- "$lock_path")" == "$(stat -Lc '%d:%i' -- "$lock_fd")" ]] || {
+  printf 'Managed lock changed while opening: %s\n' "$lock_path" >&2
+  exit 1
+}
+lock_type="$(stat -Lc '%F' -- "$lock_fd")"
+lock_uid="$(stat -Lc '%u' -- "$lock_fd")"
+lock_links="$(stat -Lc '%h' -- "$lock_fd")"
+[[ "$lock_type" == regular* && "$lock_uid" == "$UID" && "$lock_links" == 1 ]] || {
+  printf 'Refusing unsafe managed lock file: %s\n' "$lock_path" >&2
+  exit 1
+}
+chmod 0600 -- "$lock_fd"
+flock 9
+
+installer="$plugin_root/scripts/profile_installer.py"
+observer_source="$(python3 "$installer" install-data "$data_parent" "$plugin_root")"
+data_root="${observer_source%/hermes-plugin}"
+
+install_for_profile() {
+  local profile="$1"
+  local profile_home="$2"
+  [[ "$profile" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,79}$ ]] || {
+    printf 'Ignoring unsafe Hermes profile name: %s\n' "$profile" >&2
+    return 0
+  }
+  python3 "$installer" install-profile-link "$profile_home" "$observer_source" >/dev/null
+
+  if [[ "$profile" == "default" ]]; then
+    hermes plugins enable --no-allow-tool-override "$plugin_name"
+  else
+    hermes -p "$profile" plugins enable --no-allow-tool-override "$plugin_name"
+  fi
+  printf 'Enabled observer for Hermes profile: %s\n' "$profile"
+}
+
+install_for_profile default "$hermes_root"
+
+shopt -s nullglob
+for profile_home in "$hermes_root"/profiles/*; do
+  [[ -d "$profile_home" && ! -L "$profile_home" ]] || continue
+  install_for_profile "$(basename -- "$profile_home")" "$profile_home"
+done
+
+if ! python3 "$installer" is-initialized "$data_parent"; then
+  python3 "$plugin_root/hermes_bot_status.py" initialize
+  python3 "$installer" mark-initialized "$data_parent"
+fi
+printf 'Hermes Watcher observer setup complete. Restart running Hermes processes to load it.\n'

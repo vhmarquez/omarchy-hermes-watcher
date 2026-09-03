@@ -1,0 +1,9 @@
+name: omarchy-bot-status
+version: 0.1.0
+description: "Emit sanitized local turn lifecycle records for Omarchy Hermes Watcher."
+author: vhm
+provides_hooks:
+  - pre_llm_call
+  - pre_api_request
+  - post_api_request
+  - on_session_end

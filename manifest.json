@@ -1,0 +1,51 @@
+{
+  "schemaVersion": 1,
+  "id": "vhm.hermes-bots",
+  "name": "Hermes Watcher",
+  "version": "0.1.0",
+  "author": "vhm",
+  "license": "MIT",
+  "description": "Track local Hermes Agent profile turns and notify when they finish.",
+  "kinds": [
+    "service",
+    "bar-widget"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Hermes Watcher",
+    "description": "Active local Hermes profiles and recent turn outcomes.",
+    "category": "AI",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "pollIntervalSec": 2,
+      "notificationsEnabled": true,
+      "notifyOnSuccess": true,
+      "notifyOnFailure": true,
+      "notifyOnInterrupted": false,
+      "notifyOnStale": false,
+      "notifyMinDurationSec": 5,
+      "maxCatchupAgeSec": 3600,
+      "staleGraceSec": 30,
+      "historyLimit": 20,
+      "profileFilter": ""
+    },
+    "schema": [
+      { "key": "pollIntervalSec", "type": "integer", "label": "Poll interval (seconds)", "min": 1, "max": 60, "defaultValue": 2 },
+      { "key": "notificationsEnabled", "type": "boolean", "label": "Desktop notifications", "defaultValue": true },
+      { "key": "notifyOnSuccess", "type": "boolean", "label": "Notify on success", "defaultValue": true },
+      { "key": "notifyOnFailure", "type": "boolean", "label": "Notify on failure", "defaultValue": true },
+      { "key": "notifyOnInterrupted", "type": "boolean", "label": "Notify on interruption", "defaultValue": false },
+      { "key": "notifyOnStale", "type": "boolean", "label": "Notify when an Agent process disappears", "defaultValue": false },
+      { "key": "notifyMinDurationSec", "type": "integer", "label": "Minimum notification duration", "min": 0, "max": 3600, "defaultValue": 5 },
+      { "key": "maxCatchupAgeSec", "type": "integer", "label": "Maximum notification catch-up age", "min": 0, "max": 86400, "defaultValue": 3600 },
+      { "key": "staleGraceSec", "type": "integer", "label": "Stale process grace period", "min": 5, "max": 600, "defaultValue": 30 },
+      { "key": "historyLimit", "type": "integer", "label": "Recent history entries", "min": 5, "max": 100, "defaultValue": 20 },
+      { "key": "profileFilter", "type": "string", "label": "Profiles to monitor", "defaultValue": "", "description": "Optional comma-separated profile IDs. Empty monitors every instrumented local profile." }
+    ]
+  }
+}
