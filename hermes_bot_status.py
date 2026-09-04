@@ -10,10 +10,11 @@ import json
 import math
 import os
 import re
+import sqlite3
 import stat
 import threading
 import time
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from fractions import Fraction
 from pathlib import Path
 from typing import Callable
@@ -27,6 +28,7 @@ MAX_JSON_SAFE_INTEGER = (1 << 53) - 1
 _THREAD_LOCK = threading.Lock()
 _SAFE_PROFILE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,79}$")
 _HERMES_PROFILE_ID = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+_HERMES_SESSION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 _HERMES_RESERVED_PROFILE_IDS = frozenset({"hermes", "test", "tmp", "root", "sudo"})
 _REASONING_LEVELS = frozenset({"off", "on", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"})
 _RECORD_KEYS = {
@@ -62,10 +64,18 @@ def state_root() -> Path:
     return Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "omarchy/hermes-bots"
 
 
+def _configured_hermes_root() -> Path:
+    configured = os.environ.get("HERMES_ROOT", "").strip()
+    root = Path(configured).expanduser() if configured else Path.home() / ".hermes"
+    if not root.is_absolute():
+        root = Path.cwd() / root
+    return root.absolute()
+
+
 def _profile_avatar_url(profile: str, *, hermes_root: Path | None = None) -> str:
     if not _SAFE_PROFILE.fullmatch(profile):
         return ""
-    base = hermes_root or Path(os.environ.get("HERMES_ROOT", Path.home() / ".hermes"))
+    base = hermes_root or _configured_hermes_root()
     profile_dir = base if profile == "default" else base / "profiles" / profile
     assets_dir = profile_dir / "assets"
     try:
@@ -108,7 +118,7 @@ def _profile_avatar_url(profile: str, *, hermes_root: Path | None = None) -> str
 
 def _available_profiles(*, hermes_root: Path | None = None) -> list[dict]:
     """List local Hermes profile IDs without reading profile configuration."""
-    base = hermes_root or Path(os.environ.get("HERMES_ROOT", Path.home() / ".hermes"))
+    base = hermes_root or _configured_hermes_root()
     names = ["default"]
     profiles_dir = base / "profiles"
     deleted_dir = profiles_dir / ".deleted"
@@ -145,6 +155,281 @@ def _available_profiles(*, hermes_root: Path | None = None) -> list[dict]:
             {"profile": name, **({"avatarUrl": avatar_url} if avatar_url else {})}
         )
     return profiles
+
+
+def _recent_session_description(value) -> str:
+    description = " ".join(str(value or "").split())
+    if not description or not all(character.isprintable() for character in description):
+        return ""
+    return description
+
+
+def _valid_recent_session_id(value) -> bool:
+    return isinstance(value, str) and _HERMES_SESSION_ID.fullmatch(value) is not None
+
+
+def _profile_recent_sessions(
+    profile: str,
+    *,
+    hermes_root: Path,
+    limit: int,
+) -> list[dict]:
+    profile_dir = hermes_root if profile == "default" else hermes_root / "profiles" / profile
+    database_path = profile_dir / "state.db"
+    try:
+        for directory in (hermes_root, profile_dir):
+            metadata = directory.stat(follow_symlinks=False)
+            if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.geteuid():
+                return []
+        metadata = database_path.stat(follow_symlinks=False)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.geteuid():
+            return []
+    except OSError:
+        return []
+
+    try:
+        # Immutable mode is the only SQLite read path that cannot create or
+        # update WAL/SHM coordination files. It intentionally reads the latest
+        # checkpoint; a later poll sees activity after Hermes checkpoints it.
+        with closing(
+            sqlite3.connect(
+                database_path.as_uri() + "?mode=ro&immutable=1",
+                uri=True,
+                timeout=0.1,
+            )
+        ) as database:
+            database.row_factory = sqlite3.Row
+            database.create_function(
+                "watcher_valid_session_title",
+                1,
+                lambda value: int(bool(_recent_session_description(value))),
+                deterministic=True,
+            )
+            database.create_function(
+                "watcher_valid_session_id",
+                1,
+                lambda value: int(_valid_recent_session_id(value)),
+                deterministic=True,
+            )
+            database.execute("PRAGMA query_only = ON")
+            database.execute("PRAGMA busy_timeout = 100")
+            columns = {
+                str(row["name"])
+                for row in database.execute("PRAGMA table_info(sessions)").fetchall()
+            }
+            if not {"id", "title", "source", "started_at"}.issubset(columns):
+                return []
+            recency_columns = [
+                f"s.{name}"
+                for name in ("last_activity_at", "ended_at", "started_at")
+                if name in columns
+            ]
+            recency_expression = (
+                recency_columns[0]
+                if len(recency_columns) == 1
+                else f"COALESCE({', '.join(recency_columns)})"
+            )
+            conditions = [
+                "s.source IN ('cli', 'tui', 'desktop')",
+                "watcher_valid_session_id(s.id) = 1",
+                "watcher_valid_session_title(s.title) = 1",
+            ]
+            if "archived" in columns:
+                conditions.append("s.archived = 0")
+            if "hidden" in columns:
+                conditions.append("s.hidden = 0")
+            if "message_count" in columns:
+                conditions.append("s.message_count > 0")
+            listable_children = ["s.parent_session_id IS NULL"]
+            if "model_config" in columns:
+                valid_model_config = "json_valid(COALESCE(s.model_config, '{}')) = 1"
+                safe_model_config = (
+                    "CASE WHEN json_valid(COALESCE(s.model_config, '{}')) "
+                    "THEN COALESCE(s.model_config, '{}') ELSE '{}' END"
+                )
+                conditions.append(valid_model_config)
+                conditions.append(
+                    f"json_extract({safe_model_config}, '$._delegate_from') IS NULL"
+                )
+                if "parent_session_id" in columns:
+                    listable_children.extend(
+                        [
+                            f"json_extract({safe_model_config}, '$._branched_from') IS NOT NULL",
+                            f"json_extract({safe_model_config}, '$._reset_from') IS NOT NULL",
+                        ]
+                    )
+            if "parent_session_id" in columns:
+                if "end_reason" in columns:
+                    child_recency_columns = [
+                        f"child.{name}"
+                        for name in ("last_activity_at", "ended_at", "started_at")
+                        if name in columns
+                    ]
+                    child_recency = (
+                        child_recency_columns[0]
+                        if len(child_recency_columns) == 1
+                        else f"COALESCE({', '.join(child_recency_columns)})"
+                    )
+                    child_filters = [
+                        "child.parent_session_id = s.parent_session_id",
+                        "child.source IN ('cli', 'tui', 'desktop')",
+                        "watcher_valid_session_id(child.id) = 1",
+                        f"typeof({child_recency}) IN ('integer', 'real')",
+                        f"{child_recency} >= 0",
+                        f"{child_recency} <= {MAX_JSON_SAFE_INTEGER}",
+                        "typeof(child.started_at) IN ('integer', 'real')",
+                        "child.started_at >= 0",
+                        f"child.started_at <= {MAX_JSON_SAFE_INTEGER}",
+                        "watcher_valid_session_title(child.title) = 1",
+                    ]
+                    if "archived" in columns:
+                        child_filters.append("child.archived = 0")
+                    if "hidden" in columns:
+                        child_filters.append("child.hidden = 0")
+                    if "message_count" in columns:
+                        child_filters.append("child.message_count > 0")
+                    if "model_config" in columns:
+                        safe_child_model_config = (
+                            "CASE WHEN json_valid(COALESCE(child.model_config, '{}')) "
+                            "THEN COALESCE(child.model_config, '{}') ELSE '{}' END"
+                        )
+                        child_filters.extend(
+                            [
+                                "json_valid(COALESCE(child.model_config, '{}')) = 1",
+                                f"COALESCE(json_extract({safe_child_model_config}, "
+                                "'$._branched_from'), '') != s.parent_session_id",
+                                f"json_extract({safe_child_model_config}, "
+                                "'$._delegate_from') IS NULL",
+                            ]
+                        )
+                    child_priority = (
+                        "CASE WHEN child.end_reason = 'compression' THEN 0 "
+                        "WHEN child.ended_at IS NULL THEN 1 ELSE 2 END"
+                        if "ended_at" in columns
+                        else "CASE WHEN child.end_reason = 'compression' THEN 0 ELSE 1 END"
+                    )
+                    listable_children.append(
+                        "(EXISTS (SELECT 1 FROM sessions p "
+                        "WHERE p.id = s.parent_session_id "
+                        "AND p.end_reason = 'compression') "
+                        "AND s.id = (SELECT child.id FROM sessions child "
+                        f"WHERE {' AND '.join(child_filters)} "
+                        f"ORDER BY {child_priority}, {child_recency} DESC, "
+                        "child.started_at DESC, child.id DESC LIMIT 1))"
+                    )
+                    root_child_filters = [
+                        item.replace("s.parent_session_id", "s.id")
+                        for item in child_filters
+                    ]
+                    conditions.append(
+                        "(COALESCE(s.end_reason, '') != 'compression' OR "
+                        "NOT EXISTS (SELECT 1 FROM sessions child "
+                        f"WHERE {' AND '.join(root_child_filters)}))"
+                    )
+                if {"end_reason", "ended_at"}.issubset(columns):
+                    listable_children.append(
+                        "EXISTS (SELECT 1 FROM sessions p "
+                        "WHERE p.id = s.parent_session_id "
+                        "AND p.end_reason = 'branched' "
+                        "AND s.started_at >= p.ended_at)"
+                    )
+                if {"end_reason", "session_key"}.issubset(columns):
+                    listable_children.append(
+                        "EXISTS (SELECT 1 FROM sessions p "
+                        "WHERE p.id = s.parent_session_id "
+                        "AND p.end_reason IN ('session_reset', 'session_switch', "
+                        "'idle', 'daily', 'suspended', 'resume_pending_expired') "
+                        "AND s.session_key IS NOT NULL AND s.session_key != '' "
+                        "AND s.session_key = p.session_key)"
+                    )
+                conditions.append(f"({' OR '.join(listable_children)})")
+            conditions.extend(
+                [
+                    f"typeof({recency_expression}) IN ('integer', 'real')",
+                    f"{recency_expression} >= 0",
+                    f"{recency_expression} <= ?",
+                    "typeof(s.started_at) IN ('integer', 'real')",
+                    "s.started_at >= 0",
+                    "s.started_at <= ?",
+                ]
+            )
+            rows = database.execute(
+                f"""
+                SELECT s.id, s.title, s.source, s.started_at,
+                       {recency_expression} AS recent_at
+                FROM sessions s
+                WHERE {' AND '.join(conditions)}
+                ORDER BY recent_at DESC, s.started_at DESC, s.id DESC
+                LIMIT ?
+                """,
+                (MAX_JSON_SAFE_INTEGER, MAX_JSON_SAFE_INTEGER, limit),
+            ).fetchall()
+    except (OSError, sqlite3.Error, ValueError):
+        return []
+
+    avatar_url = _profile_avatar_url(profile, hermes_root=hermes_root)
+    recent = []
+    for row in rows:
+        try:
+            session_id = row["id"]
+            description = _recent_session_description(row["title"])
+            recent_at = row["recent_at"]
+            started_at = row["started_at"]
+        except (IndexError, KeyError, TypeError, ValueError):
+            continue
+        if (
+            not _valid_recent_session_id(session_id)
+            or not description
+            or not _finite_number(recent_at)
+            or not _finite_number(started_at)
+        ):
+            continue
+        if len(description) > 160:
+            description = description[:159].rstrip() + "…"
+        recent.append(
+            {
+                "profile": profile,
+                "sessionId": session_id,
+                "description": description,
+                "source": str(row["source"] or ""),
+                "recentAt": float(recent_at),
+                "_startedAt": float(started_at),
+                **({"avatarUrl": avatar_url} if avatar_url else {}),
+            }
+        )
+    return recent
+
+
+def _recent_sessions(
+    available_profiles: list[dict],
+    *,
+    hermes_root: Path,
+    limit: int,
+) -> list[dict]:
+    bounded_limit = min(6, max(1, int(limit)))
+    sessions = []
+    for available in available_profiles:
+        profile = str(available.get("profile", ""))
+        sessions.extend(
+            _profile_recent_sessions(
+                profile,
+                hermes_root=hermes_root,
+                limit=bounded_limit,
+            )
+        )
+    sessions.sort(
+        key=lambda row: (
+            float(row["recentAt"]),
+            float(row["_startedAt"]),
+            row["sessionId"],
+            row["profile"],
+        ),
+        reverse=True,
+    )
+    bounded = sessions[:bounded_limit]
+    for row in bounded:
+        row.pop("_startedAt", None)
+    return bounded
 
 
 def _finite_number(value) -> bool:
@@ -974,17 +1259,25 @@ def build_snapshot(
 
     recent = [record for record in records if record["state"] in TERMINAL_STATES]
     recent.sort(key=lambda record: float(record.get("finishedAt", 0)), reverse=True)
+    hermes_root = _configured_hermes_root()
+    available_profiles = _available_profiles(hermes_root=hermes_root)
     return {
         "schemaVersion": 1,
         "generatedAt": current,
+        "hermesRoot": str(hermes_root),
         "activeBotCount": len(active_session_rows),
         "activeTurnCount": len(active),
         "onlineBotCount": len(online_profiles),
         "onlineSessionCount": len(online_profiles),
         "onlineProfiles": online_profiles,
-        "availableProfiles": _available_profiles(),
+        "availableProfiles": available_profiles,
         "profiles": profiles,
         "recent": recent[:history_limit],
+        "recentSessions": _recent_sessions(
+            available_profiles,
+            hermes_root=hermes_root,
+            limit=history_limit,
+        ),
         "_notificationCandidates": recent,
     }
 

@@ -11,6 +11,7 @@ const parsed = Model.parseSnapshot(JSON.stringify({
   availableProfiles: [{ profile: 'default', avatarUrl: 'file:///avatar.png?v=1-2' }],
   profiles: [{ profile: 'coder', activeTurnCount: 2, runningForSec: 61 }],
   recent: [{ eventId: 'done', profile: 'coder', state: 'succeeded', durationSec: 121 }],
+  recentSessions: 'not-an-array',
   pendingNotifications: []
 }))
 assert.equal(parsed.ok, true)
@@ -20,6 +21,15 @@ assert.equal(parsed.onlineSessionCount, 4)
 assert.equal(parsed.onlineProfiles[0].profile, 'default')
 assert.equal(parsed.availableProfiles[0].profile, 'default')
 assert.equal(parsed.profiles[0].profile, 'coder')
+assert.deepEqual(parsed.recentSessions, [])
+assert.deepEqual(Model.emptySnapshot().recentSessions, [])
+const cappedRecentSessions = Model.parseSnapshot(JSON.stringify({
+  schemaVersion: 1,
+  hermesRoot: '/tmp/hermes-root',
+  recentSessions: Array.from({ length: 8 }, (_, index) => ({ sessionId: String(index) }))
+}))
+assert.equal(cappedRecentSessions.hermesRoot, '/tmp/hermes-root')
+assert.deepEqual(cappedRecentSessions.recentSessions.map(x => x.sessionId), ['0', '1', '2', '3', '4', '5'])
 assert.equal(Model.formatDuration(61), '1m 01s')
 assert.equal(Model.formatDuration(3661), '1h 01m')
 assert.equal(Model.formatRelative(940, 1000), '1m ago')

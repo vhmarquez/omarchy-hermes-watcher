@@ -69,8 +69,8 @@ class OmarchyPluginContractTests(unittest.TestCase):
         widget = (ROOT / "BarWidget.qml").read_text()
         self.assertIn("id: heroLabels", widget)
         self.assertIn("ToggleSwitch {", widget)
+        self.assertGreaterEqual(widget.count("PanelSeparator {"), 1)
         self.assertIn("ButtonGroup {", widget)
-        self.assertGreaterEqual(widget.count("PanelSeparator {"), 2)
         self.assertIn("fontFamily: root.fontFamily", widget)
         self.assertNotIn("readonly property color barForeground", widget)
         self.assertIn("root.foreground", widget)
@@ -78,28 +78,94 @@ class OmarchyPluginContractTests(unittest.TestCase):
         self.assertNotIn("font.pixelSize: 8", widget)
         self.assertNotIn("radius: 7", widget)
 
-    def test_recent_history_can_be_filtered_by_outcome(self):
+    def test_active_and_recent_sessions_are_tabs_below_agent_profiles(self):
         widget = (ROOT / "BarWidget.qml").read_text()
-        self.assertIn('property string recentFilter: "all"', widget)
-        self.assertIn("function filteredRecent()", widget)
-        self.assertIn('{ value: "success", label: "Success" }', widget)
-        self.assertIn('{ value: "issues", label: "Issues" }', widget)
-        self.assertIn("model: root.filteredRecent()", widget)
-        self.assertIn('text: "No matching outcomes"', widget)
 
-    def test_profile_rows_use_state_icons_without_repeating_state_text(self):
+        self.assertIn('property string agentTab: "active"', widget)
+        self.assertIn("id: agentTabs", widget)
+        self.assertIn('options: [{ value: "active", label: "Active" },', widget)
+        self.assertIn('{ value: "recent", label: "Recent" }]', widget)
+        self.assertIn("value: root.agentTab", widget)
+        self.assertIn("onChanged: function(value) { root.selectAgentTab(value) }", widget)
+        self.assertIn("function selectAgentTab(value)", widget)
+        self.assertIn("if (dx < 0) root.selectAgentTab(\"active\")", widget)
+        self.assertIn("else if (dx > 0) root.selectAgentTab(\"recent\")", widget)
+
+        profiles_start = widget.index("id: profileLauncherFlick")
+        tabs_start = widget.index("id: agentTabs")
+        active_start = widget.index("id: activeTabContent")
+        recent_start = widget.index("id: recentTabContent")
+        self.assertLess(profiles_start, tabs_start)
+        self.assertLess(tabs_start, active_start)
+        self.assertLess(active_start, recent_start)
+
+        active = widget[active_start:recent_start]
+        recent = widget[recent_start:]
+        self.assertIn('visible: root.agentTab === "active"', active)
+        self.assertIn("model: root.status.onlineProfiles || []", active)
+        self.assertIn('visible: root.agentTab === "recent"', recent)
+        self.assertIn("model: root.status.recentSessions || []", recent)
+        self.assertIn('text: "No recent sessions"', recent)
+        self.assertEqual(widget.count('text: "AGENTS"'), 1)
+        self.assertNotIn('PanelSectionHeader {\n        text: "RECENT"', widget)
+
+    def test_recent_section_is_bounded_to_six_sessions_without_outcome_filters(self):
+        manifest = json.loads((ROOT / "manifest.json").read_text())
+        service = (ROOT / "Service.qml").read_text()
         widget = (ROOT / "BarWidget.qml").read_text()
-        self.assertIn("Model.stateGlyph(modelData.state)", widget)
+        recent = widget.split("id: recentTabContent", 1)[1]
+        history_schema = next(
+            item for item in manifest["barWidget"]["schema"] if item["key"] == "historyLimit"
+        )
+
+        self.assertEqual(manifest["barWidget"]["defaults"]["historyLimit"], 6)
+        self.assertEqual(history_schema["max"], 6)
+        self.assertIn('Math.min(6, Math.max(1, Number(setting("historyLimit", 6))))', service)
+        self.assertIn("value.recentSessions.slice(0, 6)", (ROOT / "Model.js").read_text())
+        self.assertNotIn("recentFilter", widget)
+        self.assertNotIn("function filteredRecent()", widget)
+        self.assertNotIn("ButtonGroup {", recent)
+        self.assertNotIn('text: "No matching outcomes"', recent)
+
+    def test_recent_rows_show_session_descriptions_and_resume_the_exact_session(self):
+        service = (ROOT / "Service.qml").read_text()
+        widget = (ROOT / "BarWidget.qml").read_text()
+        recent = widget.split("id: recentTabContent", 1)[1]
+
+        self.assertIn("readonly property var recentSessions", service)
+        self.assertIn("function resumeSession(profile, sessionId)", service)
+        self.assertIn('/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/', service)
+        self.assertIn(
+            '["omarchy", "launch", "terminal", "hermes", "--profile", profile, "--resume", sessionId]',
+            service,
+        )
+        self.assertIn("environment: ({ HERMES_HOME: hermesRoot })", service)
+        self.assertIn('var hermesRoot = String(root.status.hermesRoot || "")', service)
+        self.assertIn("model: root.status.recentSessions || []", recent)
+        self.assertIn('text: String(modelData.description || "Untitled Hermes session")', recent)
+        self.assertIn("cursorShape: Qt.PointingHandCursor", recent)
+        self.assertIn(
+            'root.monitor.resumeSession(String(modelData.profile || ""), String(modelData.sessionId || ""))',
+            recent,
+        )
+        self.assertIn("root.close()", recent)
+
+    def test_recent_session_rows_use_descriptions_without_outcome_state_labels(self):
+        widget = (ROOT / "BarWidget.qml").read_text()
+        recent = widget.split("id: recentTabContent", 1)[1]
+
+        self.assertNotIn("Model.stateGlyph(modelData.state)", recent)
         self.assertNotIn("Model.stateLabel(modelData.state)", widget)
         self.assertNotIn('modelData.activeTurnCount > 0 ? "Working" : "Online"', widget)
-        self.assertGreaterEqual(widget.count('text: String(modelData.profile || "Hermes Agent")'), 2)
+        self.assertIn('text: String(modelData.description || "Untitled Hermes session")', recent)
+        self.assertIn('String(modelData.profile || "Hermes Agent")', recent)
         self.assertIn('String(modelData.model || "Unknown model")', widget)
         self.assertIn('String(modelData.platform || "local")', widget)
 
     def test_panel_shows_an_explicit_idle_state(self):
         widget = (ROOT / "BarWidget.qml").read_text()
         self.assertIn('text: "No Agents running"', widget)
-        self.assertIn("visible: root.onlineBotCount === 0", widget)
+        self.assertIn('visible: root.agentTab === "active" && root.onlineBotCount === 0', widget)
 
     def test_panel_shows_one_card_per_open_session_even_when_no_turn_hook_is_active(self):
         service = (ROOT / "Service.qml").read_text()
@@ -119,15 +185,16 @@ class OmarchyPluginContractTests(unittest.TestCase):
         self.assertIn("focusTarget: keyCatcher", widget)
         self.assertIn("PanelKeyCatcher {", widget)
         self.assertIn("ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }", widget)
-        self.assertIn("id: filterFlick", widget)
+        self.assertNotIn("id: filterFlick", widget)
 
     def test_available_profile_icons_launch_new_profile_sessions_with_safe_argv(self):
         service = (ROOT / "Service.qml").read_text()
         widget = (ROOT / "BarWidget.qml").read_text()
         agents_start = widget.index('text: "AGENTS"')
         profiles_start = widget.index("model: root.status.availableProfiles || []")
+        tabs_start = widget.index("id: agentTabs")
         active_agents_start = widget.index("model: root.status.onlineProfiles || []")
-        recent_start = widget.index('text: "RECENT"')
+        recent_start = widget.index("id: recentTabContent")
 
         self.assertIn("readonly property var availableProfiles", service)
         self.assertIn("function launchProfile(profile)", service)
@@ -141,7 +208,8 @@ class OmarchyPluginContractTests(unittest.TestCase):
         self.assertNotIn('text: "START A SESSION"', widget)
         self.assertEqual(widget.count('text: "AGENTS"'), 1)
         self.assertLess(agents_start, profiles_start)
-        self.assertLess(profiles_start, active_agents_start)
+        self.assertLess(profiles_start, tabs_start)
+        self.assertLess(tabs_start, active_agents_start)
         self.assertLess(active_agents_start, recent_start)
         self.assertIn("model: root.status.availableProfiles || []", widget)
         self.assertIn("modelData.avatarUrl", widget)

@@ -33,6 +33,7 @@ Item {
   readonly property var availableProfiles: status.availableProfiles || []
   readonly property var profiles: status.profiles || []
   readonly property var recent: status.recent || []
+  readonly property var recentSessions: status.recentSessions || []
 
   function setting(name, fallback) {
     var value = settings ? settings[name] : undefined
@@ -49,8 +50,9 @@ Item {
   }
 
   function snapshotCommand() {
+    var recentLimit = Math.min(6, Math.max(1, Number(setting("historyLimit", 6))))
     return ["python3", root.collectorPath, "snapshot",
-      "--history-limit", String(setting("historyLimit", 20)),
+      "--history-limit", String(recentLimit),
       "--stale-grace-sec", String(setting("staleGraceSec", 30)),
       "--min-duration-sec", String(setting("notifyMinDurationSec", 5)),
       "--max-catchup-age-sec", String(setting("maxCatchupAgeSec", 3600)),
@@ -76,6 +78,19 @@ Item {
     }
   }
 
+  function launchHermes(command) {
+    var hermesRoot = String(root.status.hermesRoot || "")
+    if (hermesRoot.charAt(0) !== "/" || hermesRoot.indexOf("\u0000") !== -1) {
+      root.lastError = "Cannot launch Hermes from an invalid data root"
+      return false
+    }
+    Quickshell.execDetached({
+      command: command,
+      environment: ({ HERMES_HOME: hermesRoot })
+    })
+    return true
+  }
+
   function launchProfile(profile) {
     profile = String(profile || "")
     var reserved = ["hermes", "test", "tmp", "root", "sudo"]
@@ -84,8 +99,23 @@ Item {
       root.lastError = "Cannot launch an invalid Hermes profile"
       return false
     }
-    Quickshell.execDetached(["omarchy", "launch", "terminal", "hermes", "--profile", profile])
-    return true
+    return root.launchHermes(["omarchy", "launch", "terminal", "hermes", "--profile", profile])
+  }
+
+  function resumeSession(profile, sessionId) {
+    profile = String(profile || "")
+    sessionId = String(sessionId || "")
+    var reserved = ["hermes", "test", "tmp", "root", "sudo"]
+    if (profile !== "default"
+        && (!/^[a-z0-9][a-z0-9_-]{0,63}$/.test(profile) || reserved.indexOf(profile) !== -1)) {
+      root.lastError = "Cannot resume a session for an invalid Hermes profile"
+      return false
+    }
+    if (!/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/.test(sessionId)) {
+      root.lastError = "Cannot resume an invalid Hermes session"
+      return false
+    }
+    return root.launchHermes(["omarchy", "launch", "terminal", "hermes", "--profile", profile, "--resume", sessionId])
   }
 
   function addEventIds(values, valid) {

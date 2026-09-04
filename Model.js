@@ -7,8 +7,10 @@ function emptySnapshot() {
     onlineSessionCount: 0,
     onlineProfiles: [],
     availableProfiles: [],
+    hermesRoot: "",
     profiles: [],
     recent: [],
+    recentSessions: [],
     pendingNotifications: [],
     lastError: ""
   }
@@ -32,8 +34,11 @@ function parseSnapshot(raw) {
     value.onlineSessionCount = Math.max(0, Number(value.onlineSessionCount || 0))
     value.onlineProfiles = Array.isArray(value.onlineProfiles) ? value.onlineProfiles : []
     value.availableProfiles = Array.isArray(value.availableProfiles) ? value.availableProfiles : []
+    value.hermesRoot = typeof value.hermesRoot === "string" && value.hermesRoot.charAt(0) === "/"
+      ? value.hermesRoot : ""
     value.profiles = Array.isArray(value.profiles) ? value.profiles : []
     value.recent = Array.isArray(value.recent) ? value.recent : []
+    value.recentSessions = Array.isArray(value.recentSessions) ? value.recentSessions.slice(0, 6) : []
     value.pendingNotifications = Array.isArray(value.pendingNotifications) ? value.pendingNotifications : []
     value.lastError = ""
     return value

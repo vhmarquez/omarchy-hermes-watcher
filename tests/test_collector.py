@@ -1,11 +1,12 @@
 import importlib.util
 import json
 import os
+import sqlite3
 import sys
 import tempfile
 import threading
 import unittest
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from pathlib import Path
 from unittest import mock
 
@@ -45,6 +46,55 @@ def write_record(root: Path, profile: str, name: str, **values):
     (directory / f"{name}.json").write_text(json.dumps(record))
 
 
+def write_session_db(path: Path, rows: list[dict]):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    columns = (
+        "id", "title", "source", "started_at", "ended_at", "last_activity_at",
+        "archived", "hidden", "message_count", "end_reason", "model_config",
+        "parent_session_id", "session_key",
+    )
+    defaults = {
+        "title": None,
+        "source": "cli",
+        "started_at": 1.0,
+        "ended_at": None,
+        "last_activity_at": None,
+        "archived": 0,
+        "hidden": 0,
+        "message_count": 1,
+        "end_reason": None,
+        "model_config": None,
+        "parent_session_id": None,
+        "session_key": None,
+    }
+    with closing(sqlite3.connect(path)) as database, database:
+        database.execute(
+            """
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                title TEXT,
+                source TEXT NOT NULL,
+                started_at REAL NOT NULL,
+                ended_at REAL,
+                last_activity_at REAL,
+                archived INTEGER DEFAULT 0,
+                hidden INTEGER DEFAULT 0,
+                message_count INTEGER DEFAULT 0,
+                end_reason TEXT,
+                model_config TEXT,
+                parent_session_id TEXT,
+                session_key TEXT
+            )
+            """
+        )
+        for row in rows:
+            values = {**defaults, **row}
+            database.execute(
+                f"INSERT INTO sessions ({', '.join(columns)}) VALUES ({', '.join('?' for _ in columns)})",
+                [values[column] for column in columns],
+            )
+
+
 class TrackedCmdline:
     def __init__(self, payload: bytes):
         self.payload = payload
@@ -66,6 +116,490 @@ class TrackedCmdline:
 
 
 class CollectorTests(unittest.TestCase):
+    def test_snapshot_lists_only_the_six_latest_titled_local_sessions_across_profiles(self):
+        collector = load_collector()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "state"
+            hermes_root = Path(tmp) / "hermes"
+            write_session_db(
+                hermes_root / "state.db",
+                [
+                    {
+                        "id": f"default-{index}",
+                        "title": f"Default session {index}",
+                        "last_activity_at": float(index),
+                    }
+                    for index in range(1, 5)
+                ],
+            )
+            write_session_db(
+                hermes_root / "profiles" / "coder" / "state.db",
+                [
+                    {
+                        "id": f"coder-{index}",
+                        "title": f"Coder session {index}",
+                        "last_activity_at": float(index),
+                    }
+                    for index in range(5, 9)
+                ],
+            )
+
+            with mock.patch.dict(os.environ, {"HERMES_ROOT": str(hermes_root)}):
+                snapshot = collector.build_snapshot(
+                    root,
+                    now=100.0,
+                    history_limit=20,
+                    online_sessions=[],
+                )
+
+            self.assertEqual(len(snapshot["recentSessions"]), 6)
+            self.assertEqual(
+                [row["sessionId"] for row in snapshot["recentSessions"]],
+                ["coder-8", "coder-7", "coder-6", "coder-5", "default-4", "default-3"],
+            )
+            self.assertEqual(snapshot["recentSessions"][0]["description"], "Coder session 8")
+            self.assertEqual(snapshot["recentSessions"][0]["profile"], "coder")
+            self.assertEqual(snapshot["recentSessions"][0]["recentAt"], 8.0)
+
+    def test_recent_sessions_resolve_a_relative_hermes_root_and_expose_the_exact_launch_root(self):
+        collector = load_collector()
+        with tempfile.TemporaryDirectory() as tmp:
+            previous_cwd = Path.cwd()
+            hermes_root = Path(tmp) / "hermes"
+            write_session_db(
+                hermes_root / "state.db",
+                [{"id": "relative-1", "title": "Relative root session"}],
+            )
+            try:
+                os.chdir(tmp)
+                with mock.patch.dict(os.environ, {"HERMES_ROOT": "hermes"}):
+                    snapshot = collector.build_snapshot(
+                        Path(tmp) / "state",
+                        now=100.0,
+                        online_sessions=[],
+                    )
+            finally:
+                os.chdir(previous_cwd)
+
+            self.assertEqual(snapshot["hermesRoot"], str(hermes_root))
+            self.assertEqual(
+                [row["sessionId"] for row in snapshot["recentSessions"]],
+                ["relative-1"],
+            )
+
+    def test_recent_sessions_skip_malformed_and_non_finite_timestamps(self):
+        collector = load_collector()
+        with tempfile.TemporaryDirectory() as tmp:
+            hermes_root = Path(tmp) / "hermes"
+            write_session_db(
+                hermes_root / "state.db",
+                [
+                    {"id": "bad-time", "title": "Bad time", "last_activity_at": "bad"},
+                    *[
+                        {
+                            "id": f"infinite-time-{index}",
+                            "title": f"Infinite time {index}",
+                            "last_activity_at": float("inf"),
+                        }
+                        for index in range(6)
+                    ],
+                    {"id": "valid-time", "title": "Valid time", "last_activity_at": 12.0},
+                ],
+            )
+
+            rows = collector._profile_recent_sessions(
+                "default",
+                hermes_root=hermes_root,
+                limit=6,
+            )
+
+            self.assertEqual([row["sessionId"] for row in rows], ["valid-time"])
+            json.dumps(rows, allow_nan=False)
+
+    def test_recent_sessions_filter_invalid_ids_before_applying_the_limit(self):
+        collector = load_collector()
+        with tempfile.TemporaryDirectory() as tmp:
+            hermes_root = Path(tmp) / "hermes"
+            write_session_db(
+                hermes_root / "state.db",
+                [
+                    *[
+                        {
+                            "id": f"invalid\x00id-{index}",
+                            "title": f"Invalid ID {index}",
+                            "last_activity_at": 100.0 + index,
+                        }
+                        for index in range(6)
+                    ],
+                    {"id": "valid-id", "title": "Valid ID", "last_activity_at": 12.0},
+                ],
+            )
+
+            rows = collector._profile_recent_sessions(
+                "default",
+                hermes_root=hermes_root,
+                limit=6,
+            )
+
+            self.assertEqual([row["sessionId"] for row in rows], ["valid-id"])
+
+    def test_recent_sessions_match_hermes_user_visible_child_boundary(self):
+        collector = load_collector()
+        with tempfile.TemporaryDirectory() as tmp:
+            hermes_root = Path(tmp) / "hermes"
+            write_session_db(
+                hermes_root / "state.db",
+                [
+                    {
+                        "id": "root-session",
+                        "title": "Root session",
+                        "last_activity_at": 1.0,
+                    },
+                    {
+                        "id": "delegate-session",
+                        "title": "Delegate session",
+                        "parent_session_id": "root-session",
+                        "model_config": json.dumps({"_delegate_from": "root-session"}),
+                        "last_activity_at": 10.0,
+                    },
+                    {
+                        "id": "internal-child",
+                        "title": "Internal child",
+                        "parent_session_id": "root-session",
+                        "last_activity_at": 9.0,
+                    },
+                    {
+                        "id": "branch-session",
+                        "title": "Branch session",
+                        "parent_session_id": "root-session",
+                        "model_config": json.dumps({"_branched_from": "root-session"}),
+                        "last_activity_at": 8.0,
+                    },
+                    {
+                        "id": "reset-session",
+                        "title": "Reset session",
+                        "parent_session_id": "root-session",
+                        "model_config": json.dumps({"_reset_from": "root-session"}),
+                        "last_activity_at": 7.0,
+                    },
+                ],
+            )
+
+            rows = collector._profile_recent_sessions(
+                "default",
+                hermes_root=hermes_root,
+                limit=6,
+            )
+
+            self.assertEqual(
+                [row["sessionId"] for row in rows],
+                ["branch-session", "reset-session", "root-session"],
+            )
+
+    def test_recent_sessions_surface_the_compression_tip_not_its_predecessor(self):
+        collector = load_collector()
+        with tempfile.TemporaryDirectory() as tmp:
+            hermes_root = Path(tmp) / "hermes"
+            write_session_db(
+                hermes_root / "state.db",
+                [
+                    {
+                        "id": "compression-root",
+                        "title": "Compressed conversation",
+                        "end_reason": "compression",
+                        "last_activity_at": 5.0,
+                    },
+                    {
+                        "id": "compression-tip",
+                        "title": "Compressed conversation",
+                        "parent_session_id": "compression-root",
+                        "last_activity_at": 10.0,
+                    },
+                ],
+            )
+
+            rows = collector._profile_recent_sessions(
+                "default",
+                hermes_root=hermes_root,
+                limit=6,
+            )
+
+            self.assertEqual([row["sessionId"] for row in rows], ["compression-tip"])
+
+    def test_recent_sessions_keep_a_compression_root_until_its_tip_exists(self):
+        collector = load_collector()
+        with tempfile.TemporaryDirectory() as tmp:
+            hermes_root = Path(tmp) / "hermes"
+            write_session_db(
+                hermes_root / "state.db",
+                [
+                    {
+                        "id": "compression-root",
+                        "title": "Compressed conversation",
+                        "end_reason": "compression",
+                        "last_activity_at": 5.0,
+                    }
+                ],
+            )
+
+            rows = collector._profile_recent_sessions(
+                "default",
+                hermes_root=hermes_root,
+                limit=6,
+            )
+
+            self.assertEqual([row["sessionId"] for row in rows], ["compression-root"])
+
+    def test_recent_sessions_choose_the_live_compression_tip_over_a_stale_sibling(self):
+        collector = load_collector()
+        with tempfile.TemporaryDirectory() as tmp:
+            hermes_root = Path(tmp) / "hermes"
+            write_session_db(
+                hermes_root / "state.db",
+                [
+                    {
+                        "id": "compression-root",
+                        "title": "Compressed conversation",
+                        "end_reason": "compression",
+                        "last_activity_at": 5.0,
+                    },
+                    {
+                        "id": "live-tip",
+                        "title": "Compressed conversation",
+                        "parent_session_id": "compression-root",
+                        "last_activity_at": 10.0,
+                    },
+                    {
+                        "id": "stale-sibling",
+                        "title": "Stale sibling",
+                        "parent_session_id": "compression-root",
+                        "ended_at": 30.0,
+                        "end_reason": "ws_orphan_reap",
+                        "last_activity_at": 30.0,
+                    },
+                ],
+            )
+
+            rows = collector._profile_recent_sessions(
+                "default",
+                hermes_root=hermes_root,
+                limit=6,
+            )
+
+            self.assertEqual([row["sessionId"] for row in rows], ["live-tip"])
+
+    def test_recent_sessions_ignore_malformed_compression_siblings_before_ranking(self):
+        collector = load_collector()
+        with tempfile.TemporaryDirectory() as tmp:
+            hermes_root = Path(tmp) / "hermes"
+            write_session_db(
+                hermes_root / "state.db",
+                [
+                    {
+                        "id": "compression-root",
+                        "title": "Compressed conversation",
+                        "end_reason": "compression",
+                        "last_activity_at": 5.0,
+                    },
+                    {
+                        "id": "infinite-sibling",
+                        "title": "Infinite sibling",
+                        "parent_session_id": "compression-root",
+                        "last_activity_at": float("inf"),
+                    },
+                    {
+                        "id": "text-sibling",
+                        "title": "Text sibling",
+                        "parent_session_id": "compression-root",
+                        "last_activity_at": "bad",
+                    },
+                    {
+                        "id": "control-title-sibling",
+                        "title": "Control\x00Title",
+                        "parent_session_id": "compression-root",
+                        "last_activity_at": 20.0,
+                    },
+                    {
+                        "id": "invalid/id-sibling",
+                        "title": "Invalid ID sibling",
+                        "parent_session_id": "compression-root",
+                        "last_activity_at": 25.0,
+                    },
+                    {
+                        "id": "hidden-sibling",
+                        "title": "Hidden sibling",
+                        "parent_session_id": "compression-root",
+                        "hidden": 1,
+                        "last_activity_at": 30.0,
+                    },
+                    {
+                        "id": "archived-sibling",
+                        "title": "Archived sibling",
+                        "parent_session_id": "compression-root",
+                        "archived": 1,
+                        "last_activity_at": 35.0,
+                    },
+                    {
+                        "id": "empty-sibling",
+                        "title": "Empty sibling",
+                        "parent_session_id": "compression-root",
+                        "message_count": 0,
+                        "last_activity_at": 40.0,
+                    },
+                    {
+                        "id": "remote-sibling",
+                        "title": "Remote sibling",
+                        "parent_session_id": "compression-root",
+                        "source": "telegram",
+                        "last_activity_at": 45.0,
+                    },
+                    {
+                        "id": "inherited-delegate-sibling",
+                        "title": "Inherited delegate sibling",
+                        "parent_session_id": "compression-root",
+                        "model_config": json.dumps({"_delegate_from": "another-parent"}),
+                        "last_activity_at": 50.0,
+                    },
+                    {
+                        "id": "valid-tip",
+                        "title": "Compressed conversation",
+                        "parent_session_id": "compression-root",
+                        "last_activity_at": 10.0,
+                    },
+                ],
+            )
+
+            rows = collector._profile_recent_sessions(
+                "default",
+                hermes_root=hermes_root,
+                limit=6,
+            )
+
+            self.assertEqual([row["sessionId"] for row in rows], ["valid-tip"])
+
+    def test_recent_session_reads_do_not_create_missing_wal_sidecars(self):
+        collector = load_collector()
+        with tempfile.TemporaryDirectory() as tmp:
+            hermes_root = Path(tmp) / "hermes"
+            database_path = hermes_root / "state.db"
+            write_session_db(
+                database_path,
+                [{"id": "wal-session", "title": "WAL session"}],
+            )
+            with closing(sqlite3.connect(database_path)) as database:
+                database.execute("PRAGMA journal_mode = WAL")
+                database.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            sidecars = [Path(str(database_path) + suffix) for suffix in ("-wal", "-shm")]
+            for sidecar in sidecars:
+                sidecar.unlink(missing_ok=True)
+
+            rows = collector._profile_recent_sessions(
+                "default",
+                hermes_root=hermes_root,
+                limit=6,
+            )
+
+            self.assertEqual([row["sessionId"] for row in rows], ["wal-session"])
+            self.assertFalse(any(sidecar.exists() for sidecar in sidecars))
+
+    def test_recent_session_read_cannot_recreate_sidecars_removed_before_connect(self):
+        collector = load_collector()
+        with tempfile.TemporaryDirectory() as tmp:
+            hermes_root = Path(tmp) / "hermes"
+            database_path = hermes_root / "state.db"
+            write_session_db(
+                database_path,
+                [{"id": "race-session", "title": "Race session"}],
+            )
+            writer = sqlite3.connect(database_path)
+            writer.execute("PRAGMA journal_mode = WAL")
+            writer.execute(
+                "UPDATE sessions SET title = ? WHERE id = ?",
+                ("Race session", "race-session"),
+            )
+            writer.commit()
+            sidecars = [Path(str(database_path) + suffix) for suffix in ("-wal", "-shm")]
+            self.assertTrue(all(sidecar.exists() for sidecar in sidecars))
+            real_connect = sqlite3.connect
+            writer_closed = False
+
+            def close_writer_then_connect(*args, **kwargs):
+                nonlocal writer_closed
+                writer.close()
+                writer_closed = True
+                self.assertFalse(any(sidecar.exists() for sidecar in sidecars))
+                return real_connect(*args, **kwargs)
+
+            try:
+                with mock.patch.object(
+                    collector.sqlite3,
+                    "connect",
+                    side_effect=close_writer_then_connect,
+                ):
+                    rows = collector._profile_recent_sessions(
+                        "default",
+                        hermes_root=hermes_root,
+                        limit=6,
+                    )
+            finally:
+                if not writer_closed:
+                    writer.close()
+
+            self.assertEqual([row["sessionId"] for row in rows], ["race-session"])
+            self.assertFalse(any(sidecar.exists() for sidecar in sidecars))
+
+    def test_recent_sessions_preserve_started_at_as_the_equal_recency_tiebreaker(self):
+        collector = load_collector()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "state"
+            hermes_root = Path(tmp) / "hermes"
+            write_session_db(
+                hermes_root / "state.db",
+                [{"id": "z-default", "title": "Default", "started_at": 1.0, "last_activity_at": 10.0}],
+            )
+            write_session_db(
+                hermes_root / "profiles" / "coder" / "state.db",
+                [{"id": "a-coder", "title": "Coder", "started_at": 2.0, "last_activity_at": 10.0}],
+            )
+
+            with mock.patch.dict(os.environ, {"HERMES_ROOT": str(hermes_root)}):
+                snapshot = collector.build_snapshot(root, now=100.0, online_sessions=[])
+
+            self.assertEqual(
+                [row["sessionId"] for row in snapshot["recentSessions"]],
+                ["a-coder", "z-default"],
+            )
+
+    def test_recent_sessions_support_the_legacy_minimum_session_schema(self):
+        collector = load_collector()
+        with tempfile.TemporaryDirectory() as tmp:
+            hermes_root = Path(tmp) / "hermes"
+            database_path = hermes_root / "state.db"
+            database_path.parent.mkdir(parents=True)
+            with closing(sqlite3.connect(database_path)) as database, database:
+                database.execute(
+                    """
+                    CREATE TABLE sessions (
+                        id TEXT PRIMARY KEY,
+                        title TEXT,
+                        source TEXT NOT NULL,
+                        started_at REAL NOT NULL
+                    )
+                    """
+                )
+                database.execute(
+                    "INSERT INTO sessions VALUES (?, ?, ?, ?)",
+                    ("legacy-1", "Legacy session", "cli", 5.0),
+                )
+
+            rows = collector._profile_recent_sessions(
+                "default",
+                hermes_root=hermes_root,
+                limit=6,
+            )
+
+            self.assertEqual([row["sessionId"] for row in rows], ["legacy-1"])
+
     def test_snapshot_lists_available_profiles_with_native_avatars(self):
         collector = load_collector()
         with tempfile.TemporaryDirectory() as tmp:

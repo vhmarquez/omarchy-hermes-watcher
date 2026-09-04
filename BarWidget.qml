@@ -30,7 +30,7 @@ Panel {
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
   property bool failureUnseen: false
   property string latestFailureEventId: ""
-  property string recentFilter: "all"
+  property string agentTab: "active"
   property var expandedSessionKeys: ({})
 
   implicitWidth: button.implicitWidth
@@ -59,14 +59,12 @@ Panel {
     persistSettings({ notificationsEnabled: !enabled })
   }
 
-  function filteredRecent() {
-    return Model.filterRecent(root.status.recent || [], root.recentFilter)
-  }
-
-  function cycleRecentFilter(delta) {
-    var filters = ["all", "success", "issues"]
-    var current = Math.max(0, filters.indexOf(root.recentFilter))
-    root.recentFilter = filters[(current + delta + filters.length) % filters.length]
+  function selectAgentTab(value) {
+    var next = String(value || "")
+    if (next !== "active" && next !== "recent") return
+    if (root.agentTab === next) return
+    root.agentTab = next
+    panelFlick.contentY = 0
   }
 
   function sessionDescriptionExpanded(sessionKey) {
@@ -217,10 +215,8 @@ Panel {
       anchors.fill: parent
       onCloseRequested: root.close()
       onMoveRequested: function(dx, dy) {
-        if (dx !== 0 && (root.status.recent || []).length > 0) {
-          root.cycleRecentFilter(dx)
-          return
-        }
+        if (dx < 0) root.selectAgentTab("active")
+        else if (dx > 0) root.selectAgentTab("recent")
         if (dy !== 0) {
           var limit = Math.max(0, panelFlick.contentHeight - panelFlick.height)
           panelFlick.contentY = Math.max(0, Math.min(limit,
@@ -417,7 +413,29 @@ Panel {
         }
       }
 
+      Item {
+        width: parent.width
+        implicitHeight: agentTabs.implicitHeight
+
+        ButtonGroup {
+          id: agentTabs
+          anchors.horizontalCenter: parent.horizontalCenter
+          options: [{ value: "active", label: "Active" },
+            { value: "recent", label: "Recent" }]
+          value: root.agentTab
+          foreground: root.foreground
+          background: Color.background
+          accent: Color.accent
+          fontFamily: root.fontFamily
+          fontSize: Style.font.bodySmall
+          focusable: false
+          onChanged: function(value) { root.selectAgentTab(value) }
+        }
+      }
+
       Column {
+        id: activeTabContent
+        visible: root.agentTab === "active"
         width: parent.width
         spacing: Style.space(5)
         Repeater {
@@ -587,7 +605,7 @@ Panel {
       }
 
       BorderSurface {
-        visible: root.onlineBotCount === 0
+        visible: root.agentTab === "active" && root.onlineBotCount === 0
         width: parent.width
         height: Style.space(52)
         radius: Style.cornerRadius
@@ -628,114 +646,138 @@ Panel {
         }
       }
 
-      PanelSeparator {
-        visible: (root.status.recent || []).length > 0
-        foreground: root.foreground
-      }
-
-      PanelSectionHeader {
-        text: "RECENT"
-        foreground: root.foreground
-        fontFamily: root.fontFamily
-        visible: (root.status.recent || []).length > 0
-      }
-
-      Flickable {
-        id: filterFlick
-        visible: (root.status.recent || []).length > 0
-        width: parent.width
-        height: filterGroup.implicitHeight
-        contentWidth: filterGroup.implicitWidth
-        contentHeight: height
-        clip: true
-        boundsBehavior: Flickable.StopAtBounds
-        flickableDirection: Flickable.HorizontalFlick
-        interactive: contentWidth > width
-        ScrollBar.horizontal: ScrollBar { policy: ScrollBar.AsNeeded }
-
-        ButtonGroup {
-          id: filterGroup
-          options: [
-            { value: "all", label: "All" },
-            { value: "success", label: "Success" },
-            { value: "issues", label: "Issues" }
-          ]
-          value: root.recentFilter
-          foreground: root.foreground
-          background: "transparent"
-          accent: Color.accent
-          fontFamily: root.fontFamily
-          fontSize: Style.font.bodySmall
-          focusable: false
-          onChanged: function(value) { root.recentFilter = value }
-        }
-      }
-
       Column {
+        id: recentTabContent
+        visible: root.agentTab === "recent"
         width: parent.width
         spacing: Style.space(3)
-        Repeater {
-          model: root.filteredRecent()
-          BorderSurface {
-            required property var modelData
-            width: parent.width
-            height: Style.space(52)
-            radius: Style.cornerRadius
-            color: Style.normalFillFor(root.foreground, Color.accent)
-            Row {
-              anchors.fill: parent
-              anchors.margins: Style.space(8)
-              spacing: Style.space(9)
+
+        BorderSurface {
+          visible: (root.status.recentSessions || []).length === 0
+          width: parent.width
+          height: Style.space(52)
+          radius: Style.cornerRadius
+          color: Style.normalFillFor(root.foreground, Color.accent)
+
+          Row {
+            anchors.fill: parent
+            anchors.margins: Style.space(8)
+            spacing: Style.space(9)
+
+            Text {
+              anchors.verticalCenter: parent.verticalCenter
+              textFormat: Text.PlainText
+              text: "󰅖"
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.body
+            }
+
+            Column {
+              anchors.verticalCenter: parent.verticalCenter
+              width: parent.width - Style.space(28)
+
               Text {
-                anchors.verticalCenter: parent.verticalCenter
+                width: parent.width
                 textFormat: Text.PlainText
-                text: Model.stateGlyph(modelData.state)
-                color: modelData.state === "failed" ? root.urgent : root.foreground
+                text: "No recent sessions"
+                color: root.foreground
                 font.family: root.fontFamily
-                font.pixelSize: Style.font.body
+                font.pixelSize: Style.font.bodySmall
+                font.bold: true
               }
-              Column {
-                anchors.verticalCenter: parent.verticalCenter
-                width: parent.width - Style.space(28)
-                Text {
-                  width: parent.width
-                  textFormat: Text.PlainText
-                  text: String(modelData.profile || "Hermes Agent")
-                  color: modelData.state === "failed" ? root.urgent : root.foreground
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.bodySmall
-                  font.bold: true
-                  elide: Text.ElideRight
-                }
-                Text {
-                  width: parent.width
-                  textFormat: Text.PlainText
-                  text: String(modelData.model || "Unknown model") + " · "
-                    + String(modelData.platform || "local") + " · "
-                    + Model.formatDuration(modelData.durationSec) + " · "
-                    + Model.formatRelative(modelData.finishedAt, root.status.generatedAt)
-                  color: root.dim
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.caption
-                  elide: Text.ElideRight
-                }
+
+              Text {
+                width: parent.width
+                textFormat: Text.PlainText
+                text: "Start a Hermes session to see it here"
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
               }
             }
           }
         }
-      }
 
-      Text {
-        visible: (root.status.recent || []).length > 0 && root.filteredRecent().length === 0
-        width: parent.width
-        textFormat: Text.PlainText
-        text: "No matching outcomes"
-        color: root.dim
-        font.family: root.fontFamily
-        font.pixelSize: Style.font.bodySmall
-        horizontalAlignment: Text.AlignHCenter
-        topPadding: Style.spacing.lg
-        bottomPadding: Style.spacing.lg
+        Repeater {
+          model: root.status.recentSessions || []
+          BorderSurface {
+            id: recentSessionCard
+            required property var modelData
+            width: parent.width
+            height: Style.space(56)
+            radius: Style.cornerRadius
+            color: Style.normalFillFor(root.foreground, Color.accent)
+
+            Image {
+              anchors.left: parent.left
+              anchors.leftMargin: Style.space(8)
+              anchors.verticalCenter: parent.verticalCenter
+              width: Style.space(24)
+              height: Style.space(24)
+              source: modelData.avatarUrl
+                ? String(modelData.avatarUrl)
+                : Qt.resolvedUrl("assets/hermes-watcher.svg")
+              sourceSize.width: width * Screen.devicePixelRatio
+              sourceSize.height: height * Screen.devicePixelRatio
+              fillMode: Image.PreserveAspectFit
+              asynchronous: true
+            }
+
+            Column {
+              anchors.left: parent.left
+              anchors.leftMargin: Style.space(40)
+              anchors.right: resumeGlyph.left
+              anchors.rightMargin: Style.space(8)
+              anchors.verticalCenter: parent.verticalCenter
+              spacing: Style.space(1)
+
+              Text {
+                width: parent.width
+                textFormat: Text.PlainText
+                text: String(modelData.description || "Untitled Hermes session")
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.bodySmall
+                font.bold: true
+                elide: Text.ElideRight
+              }
+
+              Text {
+                width: parent.width
+                textFormat: Text.PlainText
+                text: String(modelData.profile || "Hermes Agent") + " · "
+                  + Model.formatRelative(modelData.recentAt, root.status.generatedAt)
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                elide: Text.ElideRight
+              }
+            }
+
+            Text {
+              id: resumeGlyph
+              anchors.right: parent.right
+              anchors.rightMargin: Style.space(8)
+              anchors.verticalCenter: parent.verticalCenter
+              textFormat: Text.PlainText
+              text: "󰑐"
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.body
+            }
+
+            MouseArea {
+              anchors.fill: parent
+              cursorShape: Qt.PointingHandCursor
+              onClicked: {
+                if (root.monitor
+                    && root.monitor.resumeSession(String(modelData.profile || ""), String(modelData.sessionId || "")))
+                  root.close()
+              }
+            }
+          }
+        }
       }
       }
     }
