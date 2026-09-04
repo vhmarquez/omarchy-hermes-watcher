@@ -433,6 +433,39 @@ class CollectorTests(unittest.TestCase):
             for path in (root / "events/coder").glob("*.json"):
                 self.assertNotIn("workDescription", json.loads(path.read_text()))
 
+    def test_disabling_work_descriptions_surfaces_partial_purge_failure(self):
+        collector = load_collector()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "state"
+            record_path = root / "events/coder/running.json"
+            write_record(
+                root,
+                "coder",
+                "running",
+                workDescription="private excerpt",
+            )
+            original_atomic_json = collector._atomic_json
+
+            def fail_record_write(path, value):
+                if path == record_path:
+                    raise OSError("simulated purge failure")
+                return original_atomic_json(path, value)
+
+            with mock.patch.object(
+                collector,
+                "_atomic_json",
+                side_effect=fail_record_write,
+            ):
+                with self.assertRaises(OSError):
+                    collector.configure_privacy(
+                        root,
+                        show_work_description=False,
+                    )
+
+            policy = json.loads((root / "privacy.json").read_text())
+            self.assertIs(policy["showWorkDescription"], False)
+            self.assertIn("workDescription", json.loads(record_path.read_text()))
+
     def test_disabled_work_descriptions_are_suppressed_at_projection_boundary(self):
         collector = load_collector()
         with tempfile.TemporaryDirectory() as tmp:

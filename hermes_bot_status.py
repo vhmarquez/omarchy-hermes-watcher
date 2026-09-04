@@ -945,22 +945,34 @@ def configure_privacy(root: Path, *, show_work_description: bool) -> None:
         )
         if show_work_description:
             return
+        failures = 0
         for path in _event_json_paths(root):
             with _event_lock(root, path):
                 try:
                     value = _read_json(root, path)
-                    if (
-                        not isinstance(value, dict)
-                        or value.get("schemaVersion") != 1
-                        or value.get("profile") != path.parent.name
-                        or value.get("eventId") != path.stem
-                        or "workDescription" not in value
-                    ):
-                        continue
-                    value.pop("workDescription", None)
-                    _atomic_json(path, value)
-                except (FileNotFoundError, OSError, TypeError, ValueError):
+                except FileNotFoundError:
                     continue
+                except (OSError, TypeError, ValueError):
+                    failures += 1
+                    continue
+                if not isinstance(value, dict) or "workDescription" not in value:
+                    continue
+                if (
+                    value.get("schemaVersion") != 1
+                    or value.get("profile") != path.parent.name
+                    or value.get("eventId") != path.stem
+                ):
+                    failures += 1
+                    continue
+                value.pop("workDescription", None)
+                try:
+                    _atomic_json(path, value)
+                except FileNotFoundError:
+                    continue
+                except (OSError, TypeError, ValueError):
+                    failures += 1
+        if failures:
+            raise OSError("one or more work descriptions could not be purged")
 
 
 def initialize(root: Path) -> None:
