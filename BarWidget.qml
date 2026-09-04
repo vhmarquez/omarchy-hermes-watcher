@@ -34,6 +34,7 @@ Panel {
   property string latestFailureEventId: ""
   property string agentTab: "active"
   property var expandedSessionKeys: ({})
+  property bool clearHistoryArmed: false
 
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
@@ -150,6 +151,13 @@ Panel {
     function open(): void { root.open() }
     function close(): void { root.close() }
     function toggle(): void { root.toggle() }
+  }
+
+  Timer {
+    id: clearHistoryConfirmTimer
+    interval: 5000
+    repeat: false
+    onTriggered: root.clearHistoryArmed = false
   }
 
   BarIconButton {
@@ -883,6 +891,32 @@ Panel {
               }
             }
           }
+        }
+      }
+
+      PanelSeparator {
+        foreground: root.foreground
+      }
+
+      Button {
+        width: parent.width
+        text: root.clearHistoryArmed ? "Confirm clear history" : "Clear Watcher history"
+        iconText: root.clearHistoryArmed ? "󰜺" : "󰆴"
+        foreground: root.clearHistoryArmed ? root.urgent : root.foreground
+        fontFamily: root.fontFamily
+        focusable: true
+        bordered: true
+        enabled: root.monitor && !root.monitor.clearHistoryInProgress
+        tooltipText: "Removes terminal Hermes Watcher records only; Hermes sessions are unchanged"
+        onClicked: {
+          if (!root.clearHistoryArmed) {
+            root.clearHistoryArmed = true
+            clearHistoryConfirmTimer.restart()
+            return
+          }
+          root.clearHistoryArmed = false
+          clearHistoryConfirmTimer.stop()
+          if (root.monitor) root.monitor.clearHistory()
         }
       }
       }

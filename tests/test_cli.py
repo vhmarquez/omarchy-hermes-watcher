@@ -1,5 +1,6 @@
 import json
 import os
+import select
 import subprocess
 import sys
 import tempfile
@@ -14,6 +15,145 @@ SCRIPT = ROOT / "hermes_bot_status.py"
 
 
 class CollectorCliTests(unittest.TestCase):
+    def test_snapshot_privacy_flag_persists_policy_and_purges_excerpts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_home = Path(tmp) / "state"
+            root = state_home / "omarchy/hermes-bots"
+            write_record(
+                root,
+                "default",
+                "legacy-running",
+                workDescription="legacy private excerpt",
+            )
+            env = dict(
+                os.environ,
+                XDG_STATE_HOME=str(state_home),
+                HERMES_ROOT=str(Path(tmp) / "hermes"),
+                PYTHONDONTWRITEBYTECODE="1",
+            )
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-B",
+                    str(SCRIPT),
+                    "snapshot",
+                    "--no-show-work-description",
+                ],
+                text=True,
+                capture_output=True,
+                env=env,
+                timeout=5,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertTrue(
+                all("workDescription" not in row for row in payload["onlineProfiles"])
+            )
+            policy = json.loads((root / "privacy.json").read_text())
+            self.assertIs(policy["showWorkDescription"], False)
+            record = json.loads((root / "events/default/legacy-running.json").read_text())
+            self.assertNotIn("workDescription", record)
+
+    def test_clear_history_command_removes_terminal_records_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_root = Path(tmp) / "state/omarchy/hermes-bots"
+            now = __import__("time").time()
+            write_record(
+                state_root,
+                "coder",
+                "terminal-cli",
+                state="succeeded",
+                startedAt=now - 10,
+                finishedAt=now,
+                durationSec=10,
+            )
+            write_record(
+                state_root,
+                "coder",
+                "running-cli",
+                startedAt=now,
+                updatedAt=now,
+                writerPid=os.getpid(),
+                writerProcessStart="1",
+            )
+            env = dict(os.environ, XDG_STATE_HOME=str(Path(tmp) / "state"))
+
+            result = subprocess.run(
+                [sys.executable, "-B", str(SCRIPT), "clear-history"],
+                text=True,
+                capture_output=True,
+                env=env,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(result.stdout), {"removed": 1})
+            self.assertTrue((state_root / "events/coder/running-cli.json").exists())
+
+    def test_watch_stream_emits_initial_and_event_driven_snapshots(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_root = Path(tmp) / "state/omarchy/hermes-bots"
+            env = dict(
+                os.environ,
+                XDG_STATE_HOME=str(Path(tmp) / "state"),
+                HERMES_ROOT=str(Path(tmp) / "hermes"),
+                PYTHONDONTWRITEBYTECODE="1",
+            )
+            process = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-B",
+                    str(SCRIPT),
+                    "watch",
+                    "--health-scan-sec",
+                    "60",
+                    "--history-limit",
+                    "6",
+                ],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=env,
+            )
+            self.assertIsNotNone(process.stdout)
+            self.assertIsNotNone(process.stderr)
+            stdout = process.stdout
+            stderr = process.stderr
+            assert stdout is not None and stderr is not None
+            try:
+                ready, _, _ = select.select([stdout], [], [], 2)
+                self.assertTrue(ready, stderr.read() if process.poll() is not None else "")
+                initial_line = stdout.readline()
+                self.assertNotEqual(
+                    initial_line,
+                    "",
+                    stderr.read() if process.poll() is not None else "watch stream closed",
+                )
+                initial = json.loads(initial_line)
+                self.assertEqual(initial["schemaVersion"], 1)
+
+                now = __import__("time").time()
+                write_record(
+                    state_root,
+                    "coder",
+                    "event-driven",
+                    state="succeeded",
+                    startedAt=now - 10,
+                    finishedAt=now,
+                    durationSec=10,
+                )
+
+                ready, _, _ = select.select([stdout], [], [], 2)
+                self.assertTrue(ready, "watch stream did not react to a lifecycle record")
+                updated = json.loads(stdout.readline())
+                self.assertEqual(updated["recent"][0]["eventId"], "event-driven")
+            finally:
+                process.terminate()
+                process.communicate(timeout=2)
+
     def test_deliver_notification_claims_sends_and_acknowledges_atomically(self):
         with tempfile.TemporaryDirectory() as tmp:
             state_root = Path(tmp) / "state/omarchy/hermes-bots"

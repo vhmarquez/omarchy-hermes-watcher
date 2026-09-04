@@ -36,6 +36,12 @@ SCHEMA_VERSION = 1
 MAX_WORK_DESCRIPTION_CHARS = 160
 _REASONING_LEVELS = frozenset({"minimal", "low", "medium", "high", "xhigh", "max", "ultra"})
 _CONTEXT_MAX_CACHE: dict[tuple[str, str, str], int] = {}
+_SENSITIVE_ASSIGNMENT = re.compile(
+    r"(?i)\b([a-z0-9_-]*(?:api[_-]?key|access[_-]?key|token|password|passwd|secret|authorization|auth)[a-z0-9_-]*)"
+    r"\s*([:=])\s*.*$"
+)
+_AUTHORIZATION_VALUE = re.compile(r"(?i)\b(authorization\s*:).*$")
+_BEARER_VALUE = re.compile(r"(?i)\bbearer\s+[^\s,;]+")
 
 
 def _state_root() -> Path:
@@ -88,6 +94,7 @@ def record_observer_loaded() -> None:
                 "profile": profile,
                 "writerPid": pid,
                 "writerProcessStart": process_start,
+                "capabilities": ["work-description-policy-v1"],
             },
         )
     except Exception:
@@ -101,7 +108,36 @@ def _work_description(value: Any) -> str:
     if not isinstance(value, str):
         return ""
     without_controls = re.sub(r"[\x00-\x1f\x7f-\x9f]+", " ", value)
-    return " ".join(without_controls.split())[:MAX_WORK_DESCRIPTION_CHARS].strip()
+    redacted = _AUTHORIZATION_VALUE.sub(
+        lambda match: f"{match.group(1)}[REDACTED]",
+        without_controls,
+    )
+    redacted = _SENSITIVE_ASSIGNMENT.sub(
+        lambda match: f"{match.group(1)}{match.group(2)}[REDACTED]",
+        redacted,
+    )
+    redacted = _BEARER_VALUE.sub("Bearer [REDACTED]", redacted)
+    return " ".join(redacted.split())[:MAX_WORK_DESCRIPTION_CHARS].strip()
+
+
+def _bounded_metadata(value: Any, maximum: int) -> str:
+    text = "" if value is None else str(value)
+    printable = "".join(character for character in text if character.isprintable())
+    return printable[:maximum]
+
+
+def _show_work_description() -> bool:
+    try:
+        value = ManagedTree(_state_root()).read_json(("privacy.json",))
+    except FileNotFoundError:
+        return True
+    except (OSError, TypeError, ValueError):
+        return False
+    return bool(
+        isinstance(value, dict)
+        and value.get("schemaVersion") == 1
+        and value.get("showWorkDescription") is True
+    )
 
 
 @contextmanager
@@ -113,6 +149,18 @@ def _profile_lock(profile: str):
             yield
         finally:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+@contextmanager
+def _privacy_lock():
+    root = _state_root()
+    with ManagedTree(root).lock((".privacy.lock",)) as handle:
+        descriptor = getattr(handle, "fileno")()
+        fcntl.flock(descriptor, fcntl.LOCK_SH)
+        try:
+            yield
+        finally:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
 
 
 def _atomic_json(path: Path, data: dict[str, Any]) -> None:
@@ -134,12 +182,14 @@ def _write_turn_start(
     user_message: Any = None,
     **_: Any,
 ) -> None:
-    session_id = "" if session_id is None else str(session_id)
-    turn_id = "" if turn_id is None else str(turn_id)
-    if not session_id and not turn_id:
+    raw_session_id = "" if session_id is None else str(session_id)
+    raw_turn_id = "" if turn_id is None else str(turn_id)
+    if not raw_session_id and not raw_turn_id:
         return
     profile = _profile_name()
-    event_id = _event_id(profile, session_id, turn_id)
+    event_id = _event_id(profile, raw_session_id, raw_turn_id)
+    session_id = _bounded_metadata(raw_session_id, 128)
+    turn_id = _bounded_metadata(raw_turn_id, 128)
     now = time.time()
     pid = os.getpid()
     work_description = _work_description(user_message)
@@ -149,18 +199,20 @@ def _write_turn_start(
         "profile": profile,
         "sessionId": str(session_id),
         "turnId": str(turn_id),
-        "taskId": str(task_id),
+        "taskId": _bounded_metadata(task_id, 128),
         "state": "running",
         "startedAt": now,
         "updatedAt": now,
-        "model": str(model),
-        "platform": str(platform),
+        "model": _bounded_metadata(model, 200),
+        "platform": _bounded_metadata(platform, 100),
         "writerPid": pid,
         "writerProcessStart": _process_start(pid),
     }
-    if work_description:
-        record["workDescription"] = work_description
-    with _profile_lock(profile):
+    with _privacy_lock(), _profile_lock(profile):
+        if not _show_work_description():
+            work_description = ""
+        if work_description:
+            record["workDescription"] = work_description
         path = _event_path(profile, event_id)
         try:
             existing = _read_event(path)
@@ -175,14 +227,16 @@ def _write_turn_start(
                 existing.update(
                     {
                         "updatedAt": now,
-                        "model": str(model),
-                        "platform": str(platform),
+                        "model": _bounded_metadata(model, 200),
+                        "platform": _bounded_metadata(platform, 100),
                         "writerPid": pid,
                         "writerProcessStart": _process_start(pid),
                     }
                 )
                 if work_description:
                     existing["workDescription"] = work_description
+                else:
+                    existing.pop("workDescription", None)
                 _atomic_json(path, existing)
                 return
         _atomic_json(path, record)
@@ -369,8 +423,8 @@ def _write_api_request(
         record.update(
             {
                 "updatedAt": now,
-                "model": str(model),
-                "platform": str(platform),
+                "model": _bounded_metadata(model, 200),
+                "platform": _bounded_metadata(platform, 100),
                 "contextUsed": context_used,
                 "contextMax": context_max,
                 "contextPercent": max(
@@ -446,7 +500,7 @@ def _write_turn_end(
                     isinstance(value, dict)
                     and value.get("state") in {"running", "stale"}
                     and value.get("profile") == profile
-                    and value.get("sessionId") == str(session_id)
+                    and value.get("sessionId") == _bounded_metadata(session_id, 128)
                 ):
                     target = running_matches if value.get("state") == "running" else stale_matches
                     target.append((candidate, value))
@@ -466,9 +520,10 @@ def _write_turn_end(
                 "updatedAt": finished,
                 "finishedAt": finished,
                 "durationSec": max(0.0, finished - float(record["startedAt"])),
-                "exitReason": str(turn_exit_reason),
+                "exitReason": _bounded_metadata(turn_exit_reason, 200),
             }
         )
+        record.pop("workDescription", None)
         _atomic_json(path, record)
 
 

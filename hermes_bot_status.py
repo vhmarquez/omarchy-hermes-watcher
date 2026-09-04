@@ -4,15 +4,20 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import fcntl
 import hashlib
+import heapq
 import json
 import math
 import os
 import re
+import select
 import sqlite3
 import stat
+import struct
 import subprocess
+import sys
 import threading
 import time
 from contextlib import closing, contextmanager
@@ -27,6 +32,9 @@ TERMINAL_STATES = {"succeeded", "failed", "interrupted", "stale"}
 MAX_CLOCK_SKEW_SEC = 5.0
 MAX_JSON_SAFE_INTEGER = (1 << 53) - 1
 NOTIFICATION_CLAIM_TTL_SEC = 300.0
+MAX_NOTIFICATION_BATCH = 100
+MAX_PUBLIC_ITEMS = 100
+MAX_SNAPSHOT_BYTES = 256 * 1024
 _THREAD_LOCK = threading.Lock()
 _SAFE_PROFILE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,79}$")
 _HERMES_PROFILE_ID = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
@@ -39,6 +47,37 @@ _RECORD_KEYS = {
     "platform", "reasoningLevel", "writerPid", "writerProcessStart", "exitReason",
     "workDescription",
 }
+
+
+class SnapshotCache:
+    """Reuse validated immutable inputs across persistent collector snapshots."""
+
+    def __init__(self) -> None:
+        self.events: dict[Path, tuple[tuple[int, ...], dict]] = {}
+        self.avatars: dict[tuple[str, str], tuple[tuple, str]] = {}
+        self.recent_sessions: dict[tuple[str, str, int], tuple[tuple | None, list[dict]]] = {}
+
+
+def _metadata_signature(metadata: os.stat_result) -> tuple[int, ...] | None:
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.geteuid():
+        return None
+    return (
+        int(metadata.st_dev),
+        int(metadata.st_ino),
+        int(metadata.st_mode),
+        int(metadata.st_uid),
+        int(metadata.st_nlink),
+        int(metadata.st_mtime_ns),
+        int(metadata.st_ctime_ns),
+        int(metadata.st_size),
+    )
+
+
+def _path_signature(path: Path) -> tuple[int, ...] | None:
+    try:
+        return _metadata_signature(path.stat(follow_symlinks=False))
+    except OSError:
+        return None
 
 
 @contextmanager
@@ -62,6 +101,17 @@ def _event_lock(root: Path, path: Path):
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
+@contextmanager
+def _privacy_policy_lock(root: Path):
+    with ManagedTree(root).lock((".privacy.lock",)) as handle:
+        descriptor = getattr(handle, "fileno")()
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+
+
 def state_root() -> Path:
     return Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "omarchy/hermes-bots"
 
@@ -74,18 +124,50 @@ def _configured_hermes_root() -> Path:
     return root.absolute()
 
 
-def _profile_avatar_url(profile: str, *, hermes_root: Path | None = None) -> str:
+def _open_owned_directory(path: Path) -> int:
+    """Open an absolute directory without following any path-component symlink."""
+    absolute = path.absolute()
+    descriptor = os.open(
+        "/",
+        os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC,
+    )
+    try:
+        for component in absolute.parts[1:]:
+            next_descriptor = os.open(
+                component,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                dir_fd=descriptor,
+            )
+            os.close(descriptor)
+            descriptor = next_descriptor
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.geteuid():
+            raise ValueError("unsafe directory")
+        return descriptor
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def _read_avatar_header(descriptor: int) -> bytes:
+    return os.read(descriptor, 12)
+
+
+def _profile_avatar_url(
+    profile: str,
+    *,
+    hermes_root: Path | None = None,
+    cache: SnapshotCache | None = None,
+) -> str:
     if not _SAFE_PROFILE.fullmatch(profile):
         return ""
     base = hermes_root or _configured_hermes_root()
     profile_dir = base if profile == "default" else base / "profiles" / profile
     assets_dir = profile_dir / "assets"
+    cache_key = (str(base), profile)
     try:
-        for directory in (profile_dir, assets_dir):
-            metadata = directory.stat(follow_symlinks=False)
-            if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.geteuid():
-                return ""
-    except OSError:
+        assets_descriptor = _open_owned_directory(assets_dir)
+    except (OSError, ValueError):
         return ""
 
     signatures = {
@@ -93,35 +175,83 @@ def _profile_avatar_url(profile: str, *, hermes_root: Path | None = None) -> str
         "jpg": lambda data: data.startswith(b"\xff\xd8\xff"),
         "webp": lambda data: data.startswith(b"RIFF") and data[8:12] == b"WEBP",
     }
-    for extension, matches in signatures.items():
-        avatar = assets_dir / f"avatar.{extension}"
-        descriptor = None
-        try:
-            descriptor = os.open(
-                avatar,
-                os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
-            )
-            metadata = os.fstat(descriptor)
-            header = os.read(descriptor, 12)
-            if (
-                stat.S_ISREG(metadata.st_mode)
-                and metadata.st_uid == os.geteuid()
-                and 0 < metadata.st_size <= 2_000_000
-                and matches(header)
-            ):
-                return f"{avatar.absolute().as_uri()}?v={metadata.st_mtime_ns}-{metadata.st_size}"
-        except OSError:
-            continue
-        finally:
-            if descriptor is not None:
-                os.close(descriptor)
-    return ""
+    try:
+        for extension, matches in signatures.items():
+            descriptor = None
+            try:
+                descriptor = os.open(
+                    f"avatar.{extension}",
+                    os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+                    dir_fd=assets_descriptor,
+                )
+                metadata = os.fstat(descriptor)
+                descriptor_target = os.readlink(f"/proc/self/fd/{descriptor}")
+                signature = (
+                    extension,
+                    descriptor_target,
+                    int(metadata.st_dev),
+                    int(metadata.st_ino),
+                    int(metadata.st_mode),
+                    int(metadata.st_uid),
+                    int(metadata.st_nlink),
+                    int(metadata.st_mtime_ns),
+                    int(metadata.st_ctime_ns),
+                    int(metadata.st_size),
+                )
+                cached = cache.avatars.get(cache_key) if cache is not None else None
+                if cached is not None and cached[0] == signature:
+                    return cached[1]
+                header = _read_avatar_header(descriptor)
+                descriptor_target = os.readlink(f"/proc/self/fd/{descriptor}")
+                signature = (
+                    extension,
+                    descriptor_target,
+                    int(metadata.st_dev),
+                    int(metadata.st_ino),
+                    int(metadata.st_mode),
+                    int(metadata.st_uid),
+                    int(metadata.st_nlink),
+                    int(metadata.st_mtime_ns),
+                    int(metadata.st_ctime_ns),
+                    int(metadata.st_size),
+                )
+                if (
+                    stat.S_ISREG(metadata.st_mode)
+                    and metadata.st_uid == os.geteuid()
+                    and metadata.st_nlink == 1
+                    and 0 < metadata.st_size <= 2_000_000
+                    and matches(header)
+                ):
+                    if descriptor_target.endswith(" (deleted)"):
+                        continue
+                    validated_avatar = Path(descriptor_target)
+                    if not validated_avatar.is_absolute():
+                        continue
+                    version = (
+                        f"{metadata.st_dev}-{metadata.st_ino}-{metadata.st_mtime_ns}-"
+                        f"{metadata.st_ctime_ns}-{metadata.st_size}"
+                    )
+                    avatar_url = f"{validated_avatar.as_uri()}?v={version}"
+                    if cache is not None:
+                        cache.avatars[cache_key] = (signature, avatar_url)
+                    return avatar_url
+            except OSError:
+                continue
+            finally:
+                if descriptor is not None:
+                    os.close(descriptor)
+        if cache is not None:
+            cache.avatars.pop(cache_key, None)
+        return ""
+    finally:
+        os.close(assets_descriptor)
 
 
 def _available_profiles(
     *,
     hermes_root: Path | None = None,
     profile_filter: set[str] | None = None,
+    avatar_lookup: Callable[[str], str] | None = None,
 ) -> list[dict]:
     """List local Hermes profile IDs without reading profile configuration."""
     base = hermes_root or _configured_hermes_root()
@@ -159,7 +289,11 @@ def _available_profiles(
 
     profiles = []
     for name in names:
-        avatar_url = _profile_avatar_url(name, hermes_root=base)
+        avatar_url = (
+            avatar_lookup(name)
+            if avatar_lookup is not None
+            else _profile_avatar_url(name, hermes_root=base)
+        )
         profiles.append(
             {"profile": name, **({"avatarUrl": avatar_url} if avatar_url else {})}
         )
@@ -182,18 +316,52 @@ def _profile_recent_sessions(
     *,
     hermes_root: Path,
     limit: int,
+    avatar_url: str | None = None,
+    cache: SnapshotCache | None = None,
 ) -> list[dict]:
     profile_dir = hermes_root if profile == "default" else hermes_root / "profiles" / profile
     database_path = profile_dir / "state.db"
+    cache_key = (str(hermes_root), profile, int(limit))
+    database_signature = None
+    if avatar_url is None:
+        avatar_url = _profile_avatar_url(profile, hermes_root=hermes_root)
+
+    def with_current_avatar(values: list[dict]) -> list[dict]:
+        projected = []
+        for value in values:
+            row = {key: item for key, item in value.items() if key != "avatarUrl"}
+            if avatar_url:
+                row["avatarUrl"] = avatar_url
+            projected.append(row)
+        return projected
+
+    database_descriptor = -1
+    profile_descriptor = -1
     try:
-        for directory in (hermes_root, profile_dir):
-            metadata = directory.stat(follow_symlinks=False)
-            if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.geteuid():
-                return []
-        metadata = database_path.stat(follow_symlinks=False)
-        if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.geteuid():
-            return []
-    except OSError:
+        profile_descriptor = _open_owned_directory(profile_dir)
+        database_descriptor = os.open(
+            "state.db",
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+            dir_fd=profile_descriptor,
+        )
+        os.close(profile_descriptor)
+        profile_descriptor = -1
+        metadata = os.fstat(database_descriptor)
+        database_signature = _metadata_signature(metadata)
+        if database_signature is None or metadata.st_nlink != 1:
+            raise ValueError("unsafe session database")
+        database_uri = Path(f"/proc/self/fd/{database_descriptor}").as_uri()
+        if cache is not None:
+            cached = cache.recent_sessions.get(cache_key)
+            if cached is not None and cached[0] == database_signature:
+                os.close(database_descriptor)
+                database_descriptor = -1
+                return with_current_avatar(cached[1])
+    except (OSError, ValueError):
+        if profile_descriptor >= 0:
+            os.close(profile_descriptor)
+        if database_descriptor >= 0:
+            os.close(database_descriptor)
         return []
 
     try:
@@ -202,7 +370,7 @@ def _profile_recent_sessions(
         # checkpoint; a later poll sees activity after Hermes checkpoints it.
         with closing(
             sqlite3.connect(
-                database_path.as_uri() + "?mode=ro&immutable=1",
+                database_uri + "?mode=ro&immutable=1",
                 uri=True,
                 timeout=0.1,
             )
@@ -375,8 +543,10 @@ def _profile_recent_sessions(
             ).fetchall()
     except (OSError, sqlite3.Error, ValueError):
         return []
+    finally:
+        if database_descriptor >= 0:
+            os.close(database_descriptor)
 
-    avatar_url = _profile_avatar_url(profile, hermes_root=hermes_root)
     recent = []
     for row in rows:
         try:
@@ -400,13 +570,16 @@ def _profile_recent_sessions(
                 "profile": profile,
                 "sessionId": session_id,
                 "description": description,
-                "source": str(row["source"] or ""),
                 "recentAt": float(recent_at),
                 "_startedAt": float(started_at),
-                **({"avatarUrl": avatar_url} if avatar_url else {}),
             }
         )
-    return recent
+    if cache is not None:
+        cache.recent_sessions[cache_key] = (
+            database_signature,
+            [dict(row) for row in recent],
+        )
+    return with_current_avatar(recent)
 
 
 def _recent_sessions(
@@ -414,6 +587,8 @@ def _recent_sessions(
     *,
     hermes_root: Path,
     limit: int,
+    avatar_lookup: Callable[[str], str] | None = None,
+    cache: SnapshotCache | None = None,
 ) -> list[dict]:
     bounded_limit = min(6, max(1, int(limit)))
     sessions = []
@@ -424,6 +599,8 @@ def _recent_sessions(
                 profile,
                 hermes_root=hermes_root,
                 limit=bounded_limit,
+                avatar_url=(avatar_lookup(profile) if avatar_lookup is not None else None),
+                cache=cache,
             )
         )
     sessions.sort(
@@ -446,6 +623,61 @@ def _finite_number(value) -> bool:
         return math.isfinite(float(value))
     except (OverflowError, TypeError, ValueError):
         return False
+
+
+def _public_text(value, limit: int) -> str:
+    text = " ".join(str(value or "").split())
+    if not all(character.isprintable() for character in text):
+        return ""
+    return text[:limit]
+
+
+def _public_reasoning(value) -> str:
+    text = _public_text(value, 16)
+    return text if text in _REASONING_LEVELS else ""
+
+
+def _completion_summary(record: dict) -> dict:
+    """Project an internal lifecycle record to the public outcome DTO."""
+    return {
+        "eventId": str(record["eventId"]),
+        "profile": str(record["profile"]),
+        "state": str(record["state"]),
+        "durationSec": max(0.0, float(record["durationSec"])),
+        "finishedAt": float(record["finishedAt"]),
+    }
+
+
+def serialize_snapshot(snapshot: dict) -> str:
+    """Serialize a public snapshot within the fixed IPC payload budget."""
+
+    def encode(value: dict) -> str:
+        return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+    payload = encode(snapshot)
+    if len(payload.encode("utf-8")) <= MAX_SNAPSHOT_BYTES:
+        return payload
+    compact = dict(snapshot)
+    optional = {"avatarUrl", "workDescription", "model", "platform", "reasoningLevel"}
+    for key in ("onlineProfiles", "availableProfiles", "profiles", "recentSessions"):
+        compact[key] = [
+            {field: value for field, value in item.items() if field not in optional}
+            for item in compact.get(key, [])
+        ]
+    payload = encode(compact)
+    if len(payload.encode("utf-8")) <= MAX_SNAPSHOT_BYTES:
+        return payload
+
+    # Keep active/health state and notification progress. Trim lower-priority
+    # history and launcher rows from the oldest/end first.
+    for key in ("recentSessions", "recent", "profiles", "availableProfiles"):
+        rows = compact.get(key)
+        while isinstance(rows, list) and rows:
+            rows.pop()
+            payload = encode(compact)
+            if len(payload.encode("utf-8")) <= MAX_SNAPSHOT_BYTES:
+                return payload
+    raise ValueError("essential public snapshot exceeds size budget")
 
 
 def _valid_event_id(value) -> bool:
@@ -541,9 +773,11 @@ def _event_json_paths(root: Path) -> list[Path]:
     return paths
 
 
-def _observer_process_files(root: Path) -> list[tuple[Path, tuple[str, int, str]]]:
+def _observer_process_files(
+    root: Path,
+) -> list[tuple[Path, tuple[str, int, str], frozenset[str]]]:
     tree = ManagedTree(root)
-    registrations: list[tuple[Path, tuple[str, int, str]]] = []
+    registrations: list[tuple[Path, tuple[str, int, str], frozenset[str]]] = []
     for profile in tree.list_directories(("processes",)):
         if not _SAFE_PROFILE.fullmatch(profile):
             continue
@@ -572,29 +806,55 @@ def _observer_process_files(root: Path) -> list[tuple[Path, tuple[str, int, str]
             if name != f"{expected}.json":
                 continue
             path = root / "processes" / profile / name
-            registrations.append((path, (profile, writer_pid, process_start)))
+            raw_capabilities = value.get("capabilities", [])
+            capabilities = frozenset(
+                item
+                for item in raw_capabilities
+                if isinstance(item, str) and 0 < len(item) <= 64
+            ) if isinstance(raw_capabilities, list) else frozenset()
+            registrations.append(
+                (path, (profile, writer_pid, process_start), capabilities)
+            )
     return registrations
 
 
 def _observer_process_identities(root: Path) -> set[tuple[str, int, str]]:
-    return {identity for _, identity in _observer_process_files(root)}
+    return {identity for _, identity, _ in _observer_process_files(root)}
 
 
 def _read_json(root: Path, path: Path):
     return ManagedTree(root).read_json(path.relative_to(root).parts)
 
 
-def _record_files(root: Path, *, now: float | None = None) -> list[tuple[Path, dict]]:
+def _record_files(
+    root: Path,
+    *,
+    now: float | None = None,
+    cache: SnapshotCache | None = None,
+) -> list[tuple[Path, dict]]:
     current = time.time() if now is None else now
     records = []
-    for path in _event_json_paths(root):
+    paths = _event_json_paths(root)
+    if cache is not None:
+        retained = set(paths)
+        cache.events = {
+            path: cached for path, cached in cache.events.items() if path in retained
+        }
+    for path in paths:
         try:
-            value = _normalize_record(
-                _read_json(root, path),
-                containing_profile=path.parent.name,
-                containing_event_id=path.stem,
-                now=current,
-            )
+            signature = _path_signature(path)
+            cached = cache.events.get(path) if cache is not None else None
+            if signature is not None and cached is not None and cached[0] == signature:
+                value = dict(cached[1])
+            else:
+                value = _normalize_record(
+                    _read_json(root, path),
+                    containing_profile=path.parent.name,
+                    containing_event_id=path.stem,
+                    now=current,
+                )
+                if cache is not None and signature is not None and value is not None:
+                    cache.events[path] = (signature, dict(value))
             if value is not None:
                 records.append((path, value))
         except (OSError, ValueError, TypeError):
@@ -670,6 +930,37 @@ def _write_consumer(root: Path, acknowledged: set[str], claimed: dict[str, float
 def _write_acknowledged(root: Path, event_ids: set[str]) -> None:
     _, claimed = _consumer_state(root)
     _write_consumer(root, event_ids, claimed)
+
+
+def configure_privacy(root: Path, *, show_work_description: bool) -> None:
+    """Persist collection policy and purge excerpts when collection is disabled."""
+    ManagedTree(root).ensure_directory(())
+    with _privacy_policy_lock(root):
+        _atomic_json(
+            root / "privacy.json",
+            {
+                "schemaVersion": 1,
+                "showWorkDescription": show_work_description is True,
+            },
+        )
+        if show_work_description:
+            return
+        for path in _event_json_paths(root):
+            with _event_lock(root, path):
+                try:
+                    value = _read_json(root, path)
+                    if (
+                        not isinstance(value, dict)
+                        or value.get("schemaVersion") != 1
+                        or value.get("profile") != path.parent.name
+                        or value.get("eventId") != path.stem
+                        or "workDescription" not in value
+                    ):
+                        continue
+                    value.pop("workDescription", None)
+                    _atomic_json(path, value)
+                except (FileNotFoundError, OSError, TypeError, ValueError):
+                    continue
 
 
 def initialize(root: Path) -> None:
@@ -764,18 +1055,33 @@ def pending_notifications(
         for event_id, claimed_at in claimed.items()
         if 0 <= current - claimed_at <= NOTIFICATION_CLAIM_TTL_SEC
     }
-    return [
+    eligible = (
         record
         for record in snapshot.get("_notificationCandidates", snapshot.get("recent", []))
-        if record.get("state") in enabled
-        and record.get("eventId") not in acknowledged
-        and record.get("eventId") not in active_claims
-        and float(record.get("durationSec", 0)) >= min_duration_sec
-        and current - float(record.get("finishedAt", 0)) <= max_catchup_age_sec
-    ]
+        if (
+            record.get("state") in enabled
+            and record.get("eventId") not in acknowledged
+            and record.get("eventId") not in active_claims
+            and float(record.get("durationSec", 0)) >= min_duration_sec
+            and current - float(record.get("finishedAt", 0)) <= max_catchup_age_sec
+        )
+    )
+    return heapq.nsmallest(
+        MAX_NOTIFICATION_BATCH,
+        eligible,
+        key=lambda record: (
+            float(record.get("finishedAt", 0)),
+            str(record.get("eventId", "")),
+        ),
+    )
 
 
-def prune(root: Path, *, keep_terminal: int = 100) -> int:
+def prune(
+    root: Path,
+    *,
+    keep_terminal: int = 100,
+    max_age_sec: float | None = None,
+) -> int:
     current = time.time()
     terminal = [
         (float(record["finishedAt"]), path, record)
@@ -784,7 +1090,17 @@ def prune(root: Path, *, keep_terminal: int = 100) -> int:
     ]
     terminal.sort(key=lambda item: item[0], reverse=True)
     deleted = 0
-    for _, path, selected in terminal[max(0, keep_terminal):]:
+    selected_for_removal = [
+        (finished_at, path, record)
+        for index, (finished_at, path, record) in enumerate(terminal)
+        if index >= max(0, keep_terminal)
+        or (
+            max_age_sec is not None
+            and max_age_sec >= 0
+            and current - finished_at > max_age_sec
+        )
+    ]
+    for _, path, selected in selected_for_removal:
         with _event_lock(root, path):
             try:
                 latest = _normalize_record(
@@ -811,7 +1127,7 @@ def prune(root: Path, *, keep_terminal: int = 100) -> int:
                 if event_id in retained_ids
             },
         )
-    for path, (_, writer_pid, process_start) in _observer_process_files(root):
+    for path, (_, writer_pid, process_start), _ in _observer_process_files(root):
         if _process_alive(writer_pid, process_start):
             continue
         try:
@@ -819,6 +1135,50 @@ def prune(root: Path, *, keep_terminal: int = 100) -> int:
             deleted += 1
         except (FileNotFoundError, ValueError, TypeError):
             pass
+    return deleted
+
+
+def clear_history(root: Path) -> int:
+    """Remove terminal Watcher records while preserving live state and policy."""
+    current = time.time()
+    terminal = [
+        (path, record)
+        for path, record in _record_files(root, now=current)
+        if record["state"] in TERMINAL_STATES
+    ]
+    deleted = 0
+    failures = 0
+    for path, selected in terminal:
+        with _event_lock(root, path):
+            try:
+                latest = _normalize_record(
+                    _read_json(root, path),
+                    containing_profile=path.parent.name,
+                    containing_event_id=path.stem,
+                    now=current,
+                )
+                if latest is None or latest["state"] not in TERMINAL_STATES or latest != selected:
+                    continue
+                ManagedTree(root).unlink_regular(path.relative_to(root).parts)
+                deleted += 1
+            except FileNotFoundError:
+                continue
+            except (OSError, TypeError, ValueError):
+                failures += 1
+    with _consumer_lock(root):
+        retained_ids = {str(record["eventId"]) for record in _records(root)}
+        acknowledged, claimed = _consumer_state(root)
+        _write_consumer(
+            root,
+            acknowledged & retained_ids,
+            {
+                event_id: claimed_at
+                for event_id, claimed_at in claimed.items()
+                if event_id in retained_ids
+            },
+        )
+    if failures:
+        raise OSError("one or more terminal Watcher records could not be removed")
     return deleted
 
 
@@ -1122,17 +1482,53 @@ def build_snapshot(
     stale_grace_sec: int = 30,
     profile_filter: set[str] | None = None,
     online_sessions: list[dict] | None = None,
+    cache: SnapshotCache | None = None,
+    include_recent_sessions: bool = True,
+    include_work_descriptions: bool = True,
+    health: dict | None = None,
 ) -> dict:
     current = time.time() if now is None else now
+    hermes_root = (
+        Path(str(health["hermesRoot"])) if health is not None else _configured_hermes_root()
+    )
+    avatar_cycle: dict[str, str] = dict(health.get("avatars", {})) if health else {}
+
+    def avatar_for(profile: str) -> str:
+        if profile in avatar_cycle:
+            return avatar_cycle[profile]
+        if health is not None:
+            return ""
+        avatar_url = _profile_avatar_url(
+            profile,
+            hermes_root=hermes_root,
+            cache=cache,
+        )
+        avatar_cycle[profile] = avatar_url
+        return avatar_url
+
     alive = _process_alive if process_alive is None else process_alive
-    detected_sessions = _discover_hermes_sessions() if online_sessions is None else online_sessions
-    loaded_observers = _observer_process_identities(root)
+    detected_sessions = (
+        list(health.get("onlineSessions", []))
+        if health is not None
+        else (_discover_hermes_sessions() if online_sessions is None else online_sessions)
+    )
+    observer_registrations = (
+        list(health.get("observerRegistrations", []))
+        if health is not None
+        else _observer_process_files(root)
+    )
+    loaded_observers = {identity for _, identity, _ in observer_registrations}
+    privacy_observers = {
+        identity
+        for _, identity, capabilities in observer_registrations
+        if "work-description-policy-v1" in capabilities
+    }
     if profile_filter:
         detected_sessions = [
             session for session in detected_sessions
             if str(session.get("profile", "")) in profile_filter
         ]
-    record_files = _record_files(root, now=current)
+    record_files = _record_files(root, now=current, cache=cache)
     if profile_filter:
         record_files = [
             (path, record)
@@ -1222,12 +1618,12 @@ def build_snapshot(
             "profile": profile,
             "activeTurnCount": len(turns),
             "runningForSec": max(0.0, current - oldest),
-            "model": str(latest.get("model", "")),
-            "platform": str(latest.get("platform", "")),
-            "reasoningLevel": str(latest.get("reasoningLevel", "")),
+            "model": _public_text(latest.get("model"), 200),
+            "platform": _public_text(latest.get("platform"), 100),
+            "reasoningLevel": _public_reasoning(latest.get("reasoningLevel")),
         }
-        if latest.get("workDescription"):
-            row["workDescription"] = str(latest["workDescription"])
+        if include_work_descriptions and latest.get("workDescription"):
+            row["workDescription"] = _public_text(latest["workDescription"], 160)
         context_turns = [
             turn
             for turn in turns
@@ -1242,9 +1638,9 @@ def build_snapshot(
             )
             row.update(
                 {
-                    "model": str(context_turn.get("model", "")),
-                    "platform": str(context_turn.get("platform", "")),
-                    "reasoningLevel": str(context_turn.get("reasoningLevel", "")),
+                    "model": _public_text(context_turn.get("model"), 200),
+                    "platform": _public_text(context_turn.get("platform"), 100),
+                    "reasoningLevel": _public_reasoning(context_turn.get("reasoningLevel")),
                     "contextUsed": int(context_turn["contextUsed"]),
                     "contextMax": int(context_turn["contextMax"]),
                     "contextPercent": int(context_turn["contextPercent"]),
@@ -1252,6 +1648,7 @@ def build_snapshot(
             )
         profiles.append(row)
     profiles.sort(key=lambda row: row["profile"])
+    profiles = profiles[:MAX_PUBLIC_ITEMS]
 
     # Agent cards represent Hermes sessions, not profile aggregates. A profile
     # may own several concurrent sessions, each with its own task and context.
@@ -1272,16 +1669,16 @@ def build_snapshot(
             "profile": profile,
             "activeTurnCount": len(turns),
             "runningForSec": max(0.0, current - oldest),
-            "model": str(latest.get("model", "")),
-            "platform": str(latest.get("platform", "")),
-            "reasoningLevel": str(latest.get("reasoningLevel", "")),
+            "model": _public_text(latest.get("model"), 200),
+            "platform": _public_text(latest.get("platform"), 100),
+            "reasoningLevel": _public_reasoning(latest.get("reasoningLevel")),
             "_sessionId": session_id,
             "_writerPid": writer_pid,
             "_writerProcessStart": writer_start,
             "_updatedAt": float(latest.get("updatedAt", latest["startedAt"])),
         }
-        if latest.get("workDescription"):
-            row["workDescription"] = str(latest["workDescription"])
+        if include_work_descriptions and latest.get("workDescription"):
+            row["workDescription"] = _public_text(latest["workDescription"], 160)
         context_turns = [
             turn
             for turn in turns
@@ -1296,9 +1693,9 @@ def build_snapshot(
             )
             row.update(
                 {
-                    "model": str(context_turn.get("model", "")),
-                    "platform": str(context_turn.get("platform", "")),
-                    "reasoningLevel": str(context_turn.get("reasoningLevel", "")),
+                    "model": _public_text(context_turn.get("model"), 200),
+                    "platform": _public_text(context_turn.get("platform"), 100),
+                    "reasoningLevel": _public_reasoning(context_turn.get("reasoningLevel")),
                     "contextUsed": int(context_turn["contextUsed"]),
                     "contextMax": int(context_turn["contextMax"]),
                     "contextPercent": int(context_turn["contextPercent"]),
@@ -1354,7 +1751,7 @@ def build_snapshot(
             # start identity. Live /proc discovery always supplies one.
             context_row = last_confirmed_context.get(profile, {})
         display_row = active_row or context_row
-        avatar_url = _profile_avatar_url(profile)
+        avatar_url = avatar_for(profile)
         if session is not None:
             session_identity = (
                 "process",
@@ -1386,17 +1783,18 @@ def build_snapshot(
             "profile": profile,
             "activeTurnCount": int(active_row.get("activeTurnCount", 0)),
             "observerLoaded": bool(active_row) or observer_identity in loaded_observers,
+            "workDescriptionPolicyLoaded": observer_identity in privacy_observers,
             "runningForSec": (
                 float(session["runningForSec"])
                 if session is not None
                 else float(active_row.get("runningForSec", 0.0))
             ),
-            "model": str(display_row.get("model", "")),
-            "platform": str(display_row.get("platform", "")),
-            "reasoningLevel": str(display_row.get("reasoningLevel", "")),
+            "model": _public_text(display_row.get("model"), 200),
+            "platform": _public_text(display_row.get("platform"), 100),
+            "reasoningLevel": _public_reasoning(display_row.get("reasoningLevel")),
             **(
-                {"workDescription": str(active_row["workDescription"])}
-                if active_row.get("workDescription")
+                {"workDescription": _public_text(active_row["workDescription"], 160)}
+                if include_work_descriptions and active_row.get("workDescription")
                 else {}
             ),
             **({"avatarUrl": avatar_url} if avatar_url else {}),
@@ -1439,33 +1837,351 @@ def build_snapshot(
     online_profiles.sort(
         key=lambda row: (row["profile"], -int(row["activeTurnCount"]), -float(row["runningForSec"]))
     )
+    online_profile_count = len(online_profiles)
+    online_profiles = online_profiles[:MAX_PUBLIC_ITEMS]
 
-    recent = [record for record in records if record["state"] in TERMINAL_STATES]
-    recent.sort(key=lambda record: float(record.get("finishedAt", 0)), reverse=True)
-    hermes_root = _configured_hermes_root()
-    available_profiles = _available_profiles(
-        hermes_root=hermes_root,
-        profile_filter=profile_filter,
+    recent_records = [record for record in records if record["state"] in TERMINAL_STATES]
+    recent_records.sort(key=lambda record: float(record.get("finishedAt", 0)), reverse=True)
+    recent = [_completion_summary(record) for record in recent_records]
+    available_profiles = (
+        [dict(row) for row in health.get("availableProfiles", [])]
+        if health is not None
+        else _available_profiles(
+            hermes_root=hermes_root,
+            profile_filter=profile_filter,
+            avatar_lookup=avatar_for,
+        )
     )
+    available_profiles = available_profiles[:MAX_PUBLIC_ITEMS]
     return {
         "schemaVersion": 1,
         "generatedAt": current,
         "hermesRoot": str(hermes_root),
         "activeBotCount": len(active_session_rows),
         "activeTurnCount": len(active),
-        "onlineBotCount": len(online_profiles),
-        "onlineSessionCount": len(online_profiles),
+        "onlineBotCount": online_profile_count,
+        "onlineSessionCount": online_profile_count,
         "onlineProfiles": online_profiles,
         "availableProfiles": available_profiles,
         "profiles": profiles,
-        "recent": recent[:history_limit],
-        "recentSessions": _recent_sessions(
-            available_profiles,
-            hermes_root=hermes_root,
-            limit=history_limit,
+        "recent": recent[:min(history_limit, MAX_PUBLIC_ITEMS)],
+        "recentSessions": (
+            [dict(row) for row in health.get("recentSessions", [])]
+            if health is not None and include_recent_sessions
+            else (
+                _recent_sessions(
+                    available_profiles,
+                    hermes_root=hermes_root,
+                    limit=history_limit,
+                    avatar_lookup=avatar_for,
+                    cache=cache,
+                )
+                if include_recent_sessions
+                else []
+            )
         ),
         "_notificationCandidates": recent,
     }
+
+
+_INOTIFY_EVENT = struct.Struct("iIII")
+_INOTIFY_MASK = (
+    0x00000004  # IN_ATTRIB
+    | 0x00000008  # IN_CLOSE_WRITE
+    | 0x00000080  # IN_MOVED_TO
+    | 0x00000100  # IN_CREATE
+    | 0x00000200  # IN_DELETE
+    | 0x00000400  # IN_DELETE_SELF
+    | 0x00000800  # IN_MOVE_SELF
+    | 0x01000000  # IN_ONLYDIR
+    | 0x02000000  # IN_DONT_FOLLOW
+)
+_IN_IGNORED = 0x00008000
+_IN_Q_OVERFLOW = 0x00004000
+_IN_WATCH_INVALIDATED = _IN_IGNORED | 0x00000400 | 0x00000800
+
+
+class FilesystemChangeMonitor:
+    """Small Linux inotify wrapper used by the persistent collector."""
+
+    def __init__(self) -> None:
+        self._libc = ctypes.CDLL(None, use_errno=True)
+        self._libc.inotify_init1.argtypes = [ctypes.c_int]
+        self._libc.inotify_init1.restype = ctypes.c_int
+        self._libc.inotify_add_watch.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_uint32]
+        self._libc.inotify_add_watch.restype = ctypes.c_int
+        self._libc.inotify_rm_watch.argtypes = [ctypes.c_int, ctypes.c_int]
+        self._libc.inotify_rm_watch.restype = ctypes.c_int
+        self._fd = self._libc.inotify_init1(os.O_NONBLOCK | os.O_CLOEXEC)
+        if self._fd < 0:
+            error = ctypes.get_errno()
+            raise OSError(error, os.strerror(error))
+        self._paths: dict[Path, int] = {}
+        self._descriptors: dict[int, Path] = {}
+
+    def fileno(self) -> int:
+        return self._fd
+
+    def refresh(self, paths: list[Path]) -> bool:
+        selected = set(paths)
+        complete = True
+        for path, descriptor in list(self._paths.items()):
+            if path in selected:
+                continue
+            self._libc.inotify_rm_watch(self._fd, descriptor)
+            self._paths.pop(path, None)
+            self._descriptors.pop(descriptor, None)
+        for path in sorted(selected, key=str):
+            if path in self._paths:
+                continue
+            descriptor = self._libc.inotify_add_watch(
+                self._fd,
+                os.fsencode(path),
+                _INOTIFY_MASK,
+            )
+            if descriptor < 0:
+                complete = False
+                continue
+            self._paths[path] = descriptor
+            self._descriptors[descriptor] = path
+        return complete and selected == set(self._paths)
+
+    def drain(self) -> tuple[bool, bool]:
+        changed = False
+        complete = True
+        while True:
+            try:
+                payload = os.read(self._fd, 64 * 1024)
+            except BlockingIOError:
+                break
+            if not payload:
+                break
+            changed = True
+            offset = 0
+            while offset + _INOTIFY_EVENT.size <= len(payload):
+                descriptor, mask, _, name_length = _INOTIFY_EVENT.unpack_from(payload, offset)
+                offset += _INOTIFY_EVENT.size + name_length
+                if mask & _IN_Q_OVERFLOW:
+                    complete = False
+                if mask & _IN_WATCH_INVALIDATED:
+                    path = self._descriptors.pop(descriptor, None)
+                    if path is not None:
+                        self._paths.pop(path, None)
+                    complete = False
+        return changed, complete
+
+    def close(self) -> None:
+        if self._fd >= 0:
+            os.close(self._fd)
+            self._fd = -1
+        self._paths.clear()
+        self._descriptors.clear()
+
+
+def _safe_watch_directory(path: Path) -> bool:
+    try:
+        metadata = path.stat(follow_symlinks=False)
+        return stat.S_ISDIR(metadata.st_mode) and metadata.st_uid == os.geteuid()
+    except OSError:
+        return False
+
+
+def _watch_directories(root: Path) -> list[Path]:
+    candidates = {
+        root,
+        root / "events",
+        root / "processes",
+    }
+    tree = ManagedTree(root)
+    for kind in ("events", "processes"):
+        for profile in tree.list_directories((kind,)):
+            candidates.add(root / kind / profile)
+    return [path for path in candidates if _safe_watch_directory(path)]
+
+
+def _collect_health(root: Path, args, cache: SnapshotCache) -> dict:
+    hermes_root = _configured_hermes_root()
+    profile_filter = {
+        item.strip() for item in args.profile_filter.split(",") if item.strip()
+    }
+    avatars: dict[str, str] = {}
+
+    def avatar_for(profile: str) -> str:
+        if profile in avatars:
+            return avatars[profile]
+        avatar_url = _profile_avatar_url(
+            profile,
+            hermes_root=hermes_root,
+            cache=cache,
+        )
+        avatars[profile] = avatar_url
+        return avatar_url
+
+    available_profiles = _available_profiles(
+        hermes_root=hermes_root,
+        profile_filter=profile_filter,
+        avatar_lookup=avatar_for,
+    )
+    online_sessions = _discover_hermes_sessions()
+    if profile_filter:
+        online_sessions = [
+            row for row in online_sessions if row.get("profile") in profile_filter
+        ]
+    return {
+        "hermesRoot": str(hermes_root),
+        "avatars": avatars,
+        "availableProfiles": available_profiles,
+        "onlineSessions": online_sessions,
+        "observerRegistrations": _observer_process_files(root),
+        "recentSessions": (
+            _recent_sessions(
+                available_profiles,
+                hermes_root=hermes_root,
+                limit=max(1, args.history_limit),
+                avatar_lookup=avatar_for,
+                cache=cache,
+            )
+            if args.show_recent_session_titles
+            else []
+        ),
+    }
+
+
+def _snapshot_payload(
+    root: Path,
+    args,
+    *,
+    now: float | None = None,
+    cache: SnapshotCache | None = None,
+    health: dict | None = None,
+) -> dict:
+    effective_now = args.now if getattr(args, "now", None) is not None else now
+    snapshot = build_snapshot(
+        root,
+        now=effective_now,
+        history_limit=max(1, args.history_limit),
+        stale_grace_sec=max(1, args.stale_grace_sec),
+        profile_filter={item.strip() for item in args.profile_filter.split(",") if item.strip()},
+        cache=cache,
+        include_recent_sessions=args.show_recent_session_titles,
+        include_work_descriptions=args.show_work_description,
+        health=health,
+    )
+    try:
+        snapshot["pendingNotifications"] = pending_notifications(
+            root,
+            snapshot,
+            now=effective_now,
+            min_duration_sec=max(0, args.min_duration_sec),
+            max_catchup_age_sec=max(0, args.max_catchup_age_sec),
+            enabled_states={item for item in args.notify_states.split(",") if item},
+        )
+    except (TypeError, ValueError):
+        repair_consumer(root)
+        snapshot["pendingNotifications"] = []
+        snapshot["notificationError"] = "Notification history was repaired"
+    snapshot.pop("_notificationCandidates", None)
+    return snapshot
+
+
+def watch_snapshots(root: Path, args) -> None:
+    """Emit newline-delimited snapshots on filesystem changes and health scans."""
+    ManagedTree(root).ensure_directory(())
+    configure_privacy(
+        root,
+        show_work_description=args.show_work_description,
+    )
+    cache = SnapshotCache()
+    monitor = None
+    try:
+        monitor = FilesystemChangeMonitor()
+    except OSError:
+        pass
+    stdin = None
+    try:
+        stdin = sys.stdin if sys.stdin.fileno() >= 0 else None
+    except (AttributeError, OSError, ValueError):
+        pass
+
+    health: dict | None = None
+    last_snapshot: dict = {}
+    health_deadline = 0.0
+    fallback_deadline = float("inf")
+    active_deadline = float("inf")
+    debounce_deadline = None
+    dirty = True
+    health_due = True
+    watch_complete = (
+        monitor.refresh(_watch_directories(root))
+        if monitor is not None
+        else False
+    )
+    try:
+        while True:
+            monotonic_now = time.monotonic()
+            if health_due or health is None:
+                health = _collect_health(root, args, cache)
+                health_due = False
+                health_deadline = monotonic_now + max(5.0, float(args.health_scan_sec))
+            if dirty:
+                last_snapshot = _snapshot_payload(root, args, cache=cache, health=health)
+                print(serialize_snapshot(last_snapshot), flush=True)
+                dirty = False
+                debounce_deadline = None
+                monotonic_now = time.monotonic()
+                if monitor is not None:
+                    watch_complete = monitor.refresh(_watch_directories(root))
+                fallback_deadline = (
+                    float("inf")
+                    if watch_complete
+                    else monotonic_now + max(1.0, float(args.fallback_scan_sec))
+                )
+                active_deadline = (
+                    monotonic_now + max(1.0, float(args.fallback_scan_sec))
+                    if int(last_snapshot.get("activeTurnCount", 0)) > 0
+                    else float("inf")
+                )
+
+            deadlines = [health_deadline, fallback_deadline, active_deadline]
+            if debounce_deadline is not None:
+                deadlines.append(debounce_deadline)
+            timeout = max(0.0, min(deadlines) - time.monotonic())
+            readers = []
+            if monitor is not None:
+                readers.append(monitor)
+            if stdin is not None:
+                readers.append(stdin)
+            if not readers:
+                time.sleep(timeout)
+                ready = []
+            else:
+                ready, _, _ = select.select(readers, [], [], timeout)
+            if stdin is not None and stdin in ready:
+                line = stdin.readline()
+                if line == "":
+                    stdin = None
+                else:
+                    health_due = True
+                    dirty = True
+            if monitor is not None and monitor in ready:
+                changed, intact = monitor.drain()
+                if not intact:
+                    watch_complete = False
+                    health_due = True
+                watch_complete = monitor.refresh(_watch_directories(root)) and watch_complete
+                if changed and debounce_deadline is None:
+                    debounce_deadline = time.monotonic() + 0.05
+            monotonic_now = time.monotonic()
+            if monotonic_now >= health_deadline:
+                health_due = True
+                dirty = True
+            if monotonic_now >= fallback_deadline or monotonic_now >= active_deadline:
+                dirty = True
+            if debounce_deadline is not None and monotonic_now >= debounce_deadline:
+                dirty = True
+    finally:
+        if monitor is not None:
+            monitor.close()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1473,12 +2189,26 @@ def main(argv: list[str] | None = None) -> int:
     subparsers = parser.add_subparsers(dest="command", required=True)
     snapshot_parser = subparsers.add_parser("snapshot")
     snapshot_parser.add_argument("--now", type=float)
-    snapshot_parser.add_argument("--history-limit", type=int, default=20)
-    snapshot_parser.add_argument("--stale-grace-sec", type=int, default=30)
-    snapshot_parser.add_argument("--min-duration-sec", type=float, default=5)
-    snapshot_parser.add_argument("--max-catchup-age-sec", type=float, default=3600)
-    snapshot_parser.add_argument("--notify-states", default="succeeded,failed")
-    snapshot_parser.add_argument("--profile-filter", default="")
+    watch_parser = subparsers.add_parser("watch")
+    watch_parser.add_argument("--health-scan-sec", type=float, default=30)
+    watch_parser.add_argument("--fallback-scan-sec", type=float, default=2)
+    for snapshot_like in (snapshot_parser, watch_parser):
+        snapshot_like.add_argument("--history-limit", type=int, default=20)
+        snapshot_like.add_argument("--stale-grace-sec", type=int, default=30)
+        snapshot_like.add_argument("--min-duration-sec", type=float, default=5)
+        snapshot_like.add_argument("--max-catchup-age-sec", type=float, default=3600)
+        snapshot_like.add_argument("--notify-states", default="succeeded,failed")
+        snapshot_like.add_argument("--profile-filter", default="")
+        snapshot_like.add_argument(
+            "--show-work-description",
+            action=argparse.BooleanOptionalAction,
+            default=True,
+        )
+        snapshot_like.add_argument(
+            "--show-recent-session-titles",
+            action=argparse.BooleanOptionalAction,
+            default=True,
+        )
     acknowledge_parser = subparsers.add_parser("acknowledge")
     acknowledge_parser.add_argument("event_id")
     deliver_parser = subparsers.add_parser("deliver-notification")
@@ -1487,33 +2217,21 @@ def main(argv: list[str] | None = None) -> int:
     deliver_parser.add_argument("--title", required=True)
     deliver_parser.add_argument("--body", required=True)
     subparsers.add_parser("initialize")
+    subparsers.add_parser("clear-history")
     prune_parser = subparsers.add_parser("prune")
     prune_parser.add_argument("--keep-terminal", type=int, default=100)
+    prune_parser.add_argument("--max-age-sec", type=float, default=30 * 86400)
     args = parser.parse_args(argv)
     root = state_root()
     if args.command == "snapshot":
-        snapshot = build_snapshot(
+        configure_privacy(
             root,
-            now=args.now,
-            history_limit=max(1, args.history_limit),
-            stale_grace_sec=max(1, args.stale_grace_sec),
-            profile_filter={item.strip() for item in args.profile_filter.split(",") if item.strip()},
+            show_work_description=args.show_work_description,
         )
-        try:
-            snapshot["pendingNotifications"] = pending_notifications(
-                root,
-                snapshot,
-                now=args.now,
-                min_duration_sec=max(0, args.min_duration_sec),
-                max_catchup_age_sec=max(0, args.max_catchup_age_sec),
-                enabled_states={item for item in args.notify_states.split(",") if item},
-            )
-        except (TypeError, ValueError):
-            repair_consumer(root)
-            snapshot["pendingNotifications"] = []
-            snapshot["notificationError"] = "Notification history was repaired"
-        snapshot.pop("_notificationCandidates", None)
-        print(json.dumps(snapshot, sort_keys=True, separators=(",", ":")))
+        snapshot = _snapshot_payload(root, args)
+        print(serialize_snapshot(snapshot))
+    elif args.command == "watch":
+        watch_snapshots(root, args)
     elif args.command == "acknowledge":
         acknowledge(root, args.event_id)
     elif args.command == "deliver-notification":
@@ -1535,8 +2253,16 @@ def main(argv: list[str] | None = None) -> int:
             return 1
     elif args.command == "initialize":
         initialize(root)
+    elif args.command == "clear-history":
+        print(json.dumps({"removed": clear_history(root)}, separators=(",", ":")))
     elif args.command == "prune":
-        print(prune(root, keep_terminal=max(0, args.keep_terminal)))
+        print(
+            prune(
+                root,
+                keep_terminal=max(0, args.keep_terminal),
+                max_age_sec=max(0, args.max_age_sec),
+            )
+        )
     return 0
 
 

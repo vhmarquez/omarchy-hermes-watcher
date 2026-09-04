@@ -7,6 +7,52 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class OmarchyPluginContractTests(unittest.TestCase):
+    def test_inotify_loss_forces_a_full_health_reconciliation(self):
+        collector = (ROOT / "hermes_bot_status.py").read_text()
+
+        self.assertIn("if not intact:\n                    watch_complete = False\n                    health_due = True", collector)
+
+    def test_readme_documents_milestone_three_and_four_contracts(self):
+        readme = (ROOT / "README.md").read_text()
+
+        self.assertIn("persistent event-driven collector", readme)
+        self.assertIn("30-second health scan", readme)
+        self.assertIn("0.25% of one CPU core", readme)
+        self.assertIn("showWorkDescription", readme)
+        self.assertIn("showRecentSessionTitles", readme)
+        self.assertIn("Clear Watcher history", readme)
+        self.assertIn("256 KiB", readme)
+
+    def test_disabled_description_setting_reports_old_observers_that_need_restart(self):
+        service = (ROOT / "Service.qml").read_text()
+
+        self.assertIn('property string privacyError: ""', service)
+        self.assertIn('workDescriptionPolicyLoaded', service)
+        self.assertIn('Restart Hermes to enforce hidden work descriptions', service)
+
+    def test_history_has_time_retention_and_an_explicit_confirmed_clear_action(self):
+        manifest = json.loads((ROOT / "manifest.json").read_text())
+        service = (ROOT / "Service.qml").read_text()
+        widget = (ROOT / "BarWidget.qml").read_text()
+
+        self.assertEqual(
+            manifest["barWidget"]["defaults"].get("historyRetentionDays"),
+            30,
+        )
+        self.assertIn('function clearHistory()', service)
+        self.assertIn('"clear-history"', service)
+        self.assertIn('"--max-age-sec"', service)
+        self.assertIn('text: root.clearHistoryArmed ? "Confirm clear history"', widget)
+        self.assertIn('root.monitor.clearHistory()', widget)
+
+    def test_history_clear_does_not_race_notification_delivery(self):
+        service = (ROOT / "Service.qml").read_text()
+
+        self.assertIn("if (notifyProcess.running || ackProcess.running)", service)
+        self.assertIn("notificationQueue = []", service)
+        self.assertIn("acknowledgementQueue = []", service)
+        self.assertIn("if (clearHistoryInProgress) return", service)
+
     def test_product_contract_records_milestone_zero_decisions(self):
         contract = (ROOT / "docs/product-contract.md").read_text()
 
@@ -22,7 +68,8 @@ class OmarchyPluginContractTests(unittest.TestCase):
         self.assertIn("Omarchy 4.0 or newer", contract)
         self.assertIn("Python 3.11 or newer", contract)
         self.assertIn("Idle performance target", contract)
-        self.assertIn("Milestone 3 future work", contract)
+        self.assertIn("Milestone 3 is implemented", contract)
+        self.assertIn("Milestone 4 privacy controls", contract)
         self.assertIn("Milestone 6 future work", contract)
 
     def test_readme_documents_milestone_two_recovery_contracts(self):
@@ -44,15 +91,18 @@ class OmarchyPluginContractTests(unittest.TestCase):
         self.assertEqual(manifest["entryPoints"]["barWidget"], "BarWidget.qml")
         defaults = manifest["barWidget"]["defaults"]
         self.assertEqual(defaults["pollIntervalSec"], 2)
+        self.assertEqual(defaults.get("healthScanIntervalSec"), 30)
         self.assertTrue(defaults["notifyOnSuccess"])
         self.assertTrue(defaults["notifyOnFailure"])
+        self.assertIs(defaults.get("showWorkDescription"), True)
+        self.assertIs(defaults.get("showRecentSessionTitles"), True)
         self.assertEqual(defaults["profileFilter"], "")
 
     def test_qml_uses_shared_service_and_safe_process_argv(self):
         service = (ROOT / "Service.qml").read_text()
         widget = (ROOT / "BarWidget.qml").read_text()
         icon = ROOT / "assets" / "hermes-watcher.svg"
-        self.assertIn('command: ["timeout", "5s", "python3", root.collectorPath', service)
+        self.assertIn('var command = ["python3", "-B", root.collectorPath, "watch"', service)
         self.assertIn('["timeout", "15s", "python3", root.collectorPath, "deliver-notification"', service)
         self.assertIn('Qt.resolvedUrl("assets/hermes-watcher.svg")', service)
         self.assertIn('"--icon", root.notificationIconPath', service)
@@ -154,7 +204,7 @@ class OmarchyPluginContractTests(unittest.TestCase):
         self.assertEqual(manifest["barWidget"]["defaults"]["historyLimit"], 6)
         self.assertEqual(history_schema["max"], 6)
         self.assertIn('Math.min(6, Math.max(1, Number(setting("historyLimit", 6))))', service)
-        self.assertIn("value.recentSessions.slice(0, 6)", (ROOT / "Model.js").read_text())
+        self.assertIn("validatedArray(value.recentSessions, 100, validRecentSession).slice(0, 6)", (ROOT / "Model.js").read_text())
         self.assertNotIn("recentFilter", widget)
         self.assertNotIn("function filteredRecent()", widget)
         self.assertNotIn("ButtonGroup {", recent)
@@ -458,16 +508,20 @@ class OmarchyPluginContractTests(unittest.TestCase):
         self.assertNotIn("enqueueAcknowledgement(eventId)", delivered)
         self.assertIn("onExited: function(exitCode) { root.finishNotificationResult(exitCode) }", service)
 
-    def test_snapshot_output_is_applied_only_after_a_successful_process_exit(self):
+    def test_stream_output_is_validated_before_application_and_unexpected_exit_retries(self):
         service = (ROOT / "Service.qml").read_text()
-        self.assertIn("function finishSnapshot(exitCode, exitStatus, raw)", service)
-        self.assertIn("if (exitCode !== 0 || exitStatus !== 0)", service)
-        self.assertIn("id: snapshotStdout", service)
+        self.assertIn("id: collectorProcess", service)
+        self.assertIn("stdout: SplitParser", service)
+        self.assertIn("onRead: function(line) { root.applySnapshot(line) }", service)
+        self.assertIn("property bool collectorWanted: true", service)
+        self.assertIn("id: collectorWatchdogTimer", service)
+        self.assertIn("repeat: false", service)
+        self.assertIn("if (!root.collectorWanted) return", service)
+        self.assertIn("root.collectorWanted = false", service)
         self.assertIn(
-            "onExited: function(exitCode, exitStatus) { root.finishSnapshot(exitCode, exitStatus, snapshotStdout.text) }",
+            'recordCollectorFailure("Hermes Watcher collector exited unexpectedly")',
             service,
         )
-        self.assertNotIn("onStreamFinished: root.applySnapshot(text)", service)
 
     def test_observer_setup_failure_has_bounded_retry_and_manual_recovery(self):
         service = (ROOT / "Service.qml").read_text()
@@ -491,7 +545,7 @@ class OmarchyPluginContractTests(unittest.TestCase):
     def test_invalid_snapshot_preserves_the_last_real_status(self):
         service = (ROOT / "Service.qml").read_text()
         apply_snapshot = service.split("function applySnapshot(raw)", 1)[1].split(
-            "function finishSnapshot", 1
+            "function recordCollectorFailure", 1
         )[0]
         invalid_guard = apply_snapshot.find("if (!parsed.ok)")
         status_assignment = apply_snapshot.index("status = parsed")
@@ -513,7 +567,7 @@ class OmarchyPluginContractTests(unittest.TestCase):
         self.assertIn('property string acknowledgementError: ""', service)
         self.assertIn('property string consumerError: ""', service)
         self.assertIn('property string actionError: ""', service)
-        self.assertIn("readonly property bool refreshing: snapshotProcess.running", service)
+        self.assertIn("readonly property bool refreshing: collectorRefreshPending", service)
         self.assertIn("hasSnapshot = true", service)
         self.assertIn("lastSuccessfulSnapshotAt = Number(parsed.generatedAt || Date.now() / 1000)", service)
         self.assertIn('consumerError = String(parsed.notificationError || "")', service)
@@ -522,10 +576,12 @@ class OmarchyPluginContractTests(unittest.TestCase):
         service = (ROOT / "Service.qml").read_text()
 
         self.assertIn('["timeout", "30s", root.setupScriptPath]', service)
-        self.assertIn('return ["timeout", "5s", "python3", root.collectorPath, "snapshot"', service)
+        self.assertIn('var command = ["python3", "-B", root.collectorPath, "watch"', service)
+        self.assertIn("collectorProcess.signal(15)", service)
         self.assertIn('["timeout", "15s", "python3", root.collectorPath, "deliver-notification"', service)
         self.assertIn('["timeout", "5s", "python3", root.collectorPath, "acknowledge"', service)
-        self.assertIn('["timeout", "30s", "python3", root.collectorPath, "prune"', service)
+        self.assertIn('["timeout", "30s", "python3", "-B", root.collectorPath,', service)
+        self.assertIn('"prune", "--keep-terminal", "100", "--max-age-sec"', service)
 
     def test_setup_and_collector_failures_use_bounded_exponential_backoff(self):
         service = (ROOT / "Service.qml").read_text()
@@ -544,6 +600,9 @@ class OmarchyPluginContractTests(unittest.TestCase):
 
         self.assertIn("function refresh(): string { root.refresh(true); return \"ok\" }", service)
         self.assertGreaterEqual(widget.count("root.monitor.refresh(true)"), 2)
+        self.assertIn("if (force === true) {", service)
+        self.assertIn("collectorRetryAfter = 0", service)
+        self.assertIn("collectorRetryTimer.stop()", service)
 
     def test_partial_profile_setup_keeps_status_available_and_retries(self):
         service = (ROOT / "Service.qml").read_text()

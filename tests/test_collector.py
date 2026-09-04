@@ -1,5 +1,6 @@
 import importlib.util
 import hashlib
+import inspect
 import json
 import os
 import sqlite3
@@ -118,6 +119,523 @@ class TrackedCmdline:
 
 
 class CollectorTests(unittest.TestCase):
+    def test_persistent_collector_arms_watches_before_initial_reconciliation(self):
+        collector = load_collector()
+        events = []
+
+        class StopWatch(Exception):
+            pass
+
+        class Monitor:
+            def refresh(self, _paths):
+                events.append("arm")
+                return True
+
+            def close(self):
+                events.append("close")
+
+        def stop_after_scan(*_args):
+            events.append("scan")
+            raise StopWatch()
+
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            mock.patch.object(collector, "FilesystemChangeMonitor", return_value=Monitor()),
+            mock.patch.object(collector, "configure_privacy"),
+            mock.patch.object(collector, "_collect_health", side_effect=stop_after_scan),
+        ):
+            args = mock.Mock(show_work_description=True)
+            with self.assertRaises(StopWatch):
+                collector.watch_snapshots(Path(tmp) / "state", args)
+
+        self.assertEqual(events[:2], ["arm", "scan"])
+
+    def test_inotify_self_move_drops_the_stale_watch_mapping(self):
+        collector = load_collector()
+        monitor = collector.FilesystemChangeMonitor.__new__(
+            collector.FilesystemChangeMonitor
+        )
+        watched = Path("/tmp/watched")
+        monitor._fd = 123
+        monitor._paths = {watched: 5}
+        monitor._descriptors = {5: watched}
+        payload = collector._INOTIFY_EVENT.pack(5, 0x00000800, 0, 0)
+
+        with mock.patch.object(
+            collector.os,
+            "read",
+            side_effect=[payload, BlockingIOError()],
+        ):
+            changed, intact = monitor.drain()
+
+        self.assertTrue(changed)
+        self.assertFalse(intact)
+        self.assertEqual(monitor._paths, {})
+        self.assertEqual(monitor._descriptors, {})
+
+    def test_public_projection_bounds_legacy_record_strings(self):
+        collector = load_collector()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "state"
+            write_record(
+                root,
+                "default",
+                "legacy",
+                model="m" * 500,
+                platform="p" * 300,
+                workDescription="w" * 500,
+            )
+
+            snapshot = collector.build_snapshot(
+                root,
+                now=110,
+                online_sessions=[],
+                process_alive=lambda _pid, _start: True,
+            )
+
+            session = snapshot["onlineProfiles"][0]
+            self.assertEqual(len(session["model"]), 200)
+            self.assertEqual(len(session["platform"]), 100)
+            self.assertNotIn("workDescription", session)
+
+            write_record(
+                root,
+                "coder",
+                "legacy-context",
+                state="succeeded",
+                finishedAt=109,
+                durationSec=9,
+                model="m" * 500,
+                platform="p" * 300,
+                contextUsed=50,
+                contextMax=100,
+                contextPercent=50,
+                contextConfirmed=True,
+            )
+            snapshot = collector.build_snapshot(
+                root,
+                now=110,
+                online_sessions=[
+                    {
+                        "profile": "coder",
+                        "pid": 10,
+                        "processStart": "20",
+                        "runningForSec": 9,
+                    }
+                ],
+            )
+            context_session = next(
+                row for row in snapshot["onlineProfiles"] if row["profile"] == "coder"
+            )
+            self.assertEqual(len(context_session["model"]), 200)
+            self.assertEqual(len(context_session["platform"]), 100)
+
+    def test_public_snapshot_bounds_arrays_before_qml_projection(self):
+        collector = load_collector()
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
+            os.environ,
+            {"HERMES_ROOT": str(Path(tmp) / "hermes")},
+        ):
+            root = Path(tmp) / "state"
+            hermes_root = Path(tmp) / "hermes"
+            profiles_root = hermes_root / "profiles"
+            profiles_root.mkdir(parents=True)
+            for index in range(110):
+                (profiles_root / f"profile_{index}").mkdir()
+            online = [
+                {
+                    "profile": f"profile_{index}",
+                    "pid": 1000 + index,
+                    "processStart": str(2000 + index),
+                    "runningForSec": 1,
+                }
+                for index in range(110)
+            ]
+
+            snapshot = collector.build_snapshot(root, now=10, online_sessions=online)
+
+            self.assertEqual(len(snapshot["onlineProfiles"]), 100)
+            self.assertEqual(snapshot["onlineSessionCount"], 110)
+            self.assertEqual(snapshot["onlineBotCount"], 110)
+            self.assertEqual(len(snapshot["availableProfiles"]), 100)
+
+    def test_snapshot_serialization_enforces_a_total_payload_budget(self):
+        collector = load_collector()
+        snapshot = {
+            "schemaVersion": 1,
+            "generatedAt": 1.0,
+            "hermesRoot": "/tmp/hermes",
+            "activeBotCount": 0,
+            "activeTurnCount": 0,
+            "onlineBotCount": 0,
+            "onlineSessionCount": 0,
+            "onlineProfiles": [],
+            "availableProfiles": [
+                {
+                    "profile": f"profile-{index}",
+                    "avatarUrl": "file:///" + "x" * 4000,
+                }
+                for index in range(100)
+            ],
+            "profiles": [],
+            "recent": [],
+            "recentSessions": [
+                {
+                    "sessionId": f"session-{index}",
+                    "profile": "default",
+                    "description": "y" * 4000,
+                    "startedAt": 1.0,
+                    "updatedAt": 2.0,
+                }
+                for index in range(100)
+            ],
+            "pendingNotifications": [
+                {
+                    "eventId": "oldest-pending",
+                    "profile": "default",
+                    "state": "succeeded",
+                    "durationSec": 1.0,
+                    "finishedAt": 2.0,
+                }
+            ],
+        }
+
+        self.assertTrue(
+            hasattr(collector, "serialize_snapshot"),
+            "collector does not enforce a total public snapshot budget",
+        )
+        payload = collector.serialize_snapshot(snapshot)
+
+        self.assertLessEqual(len(payload.encode("utf-8")), 256 * 1024)
+        decoded = json.loads(payload)
+        self.assertTrue(
+            all("avatarUrl" not in profile for profile in decoded["availableProfiles"])
+        )
+        self.assertEqual(
+            decoded["pendingNotifications"][0]["eventId"],
+            "oldest-pending",
+        )
+
+    def test_clear_history_removes_only_terminal_watcher_records(self):
+        collector = load_collector()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "state"
+            write_record(root, "coder", "running")
+            write_record(
+                root,
+                "coder",
+                "terminal",
+                state="failed",
+                finishedAt=200.0,
+                durationSec=100.0,
+            )
+            collector.acknowledge(root, "terminal")
+            collector.configure_privacy(root, show_work_description=False)
+            process_dir = root / "processes/coder"
+            process_dir.mkdir(parents=True)
+            marker = process_dir / "observer.json"
+            marker.write_text("{}")
+
+            self.assertTrue(
+                hasattr(collector, "clear_history"),
+                "collector does not provide explicit history clearing",
+            )
+            removed = collector.clear_history(root)
+
+            self.assertEqual(removed, 1)
+            self.assertTrue((root / "events/coder/running.json").exists())
+            self.assertFalse((root / "events/coder/terminal.json").exists())
+            self.assertTrue((root / "privacy.json").exists())
+            self.assertTrue(marker.exists())
+            self.assertNotIn("terminal", collector._acknowledged(root))
+
+    def test_clear_history_surfaces_partial_deletion_failure(self):
+        collector = load_collector()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "state"
+            write_record(
+                root,
+                "coder",
+                "first",
+                state="failed",
+                finishedAt=200,
+                durationSec=100,
+            )
+            write_record(
+                root,
+                "coder",
+                "second",
+                state="succeeded",
+                finishedAt=201,
+                durationSec=101,
+            )
+            original = collector.ManagedTree.unlink_regular
+
+            def fail_second(tree, parts):
+                if parts[-1] == "second.json":
+                    raise OSError("simulated deletion failure")
+                return original(tree, parts)
+
+            with mock.patch.object(collector.ManagedTree, "unlink_regular", fail_second):
+                with self.assertRaises(OSError):
+                    collector.clear_history(root)
+
+            self.assertFalse((root / "events/coder/first.json").exists())
+            self.assertTrue((root / "events/coder/second.json").exists())
+
+    def test_disabling_recent_titles_skips_all_session_database_access(self):
+        collector = load_collector()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "state"
+            hermes_root = Path(tmp) / "hermes"
+            hermes_root.mkdir()
+            with (
+                mock.patch.dict(os.environ, {"HERMES_ROOT": str(hermes_root)}),
+                mock.patch.object(collector, "_profile_recent_sessions") as recent_reader,
+            ):
+                self.assertIn(
+                    "include_recent_sessions",
+                    inspect.signature(collector.build_snapshot).parameters,
+                )
+                snapshot = collector.build_snapshot(
+                    root,
+                    now=100.0,
+                    online_sessions=[],
+                    include_recent_sessions=False,
+                )
+
+            self.assertEqual(snapshot["recentSessions"], [])
+            recent_reader.assert_not_called()
+
+    def test_disabling_work_descriptions_purges_existing_persisted_excerpts(self):
+        collector = load_collector()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "state"
+            write_record(root, "coder", "running", workDescription="Private running text")
+            write_record(
+                root,
+                "coder",
+                "terminal",
+                state="succeeded",
+                finishedAt=200.0,
+                durationSec=100.0,
+                workDescription="Private terminal text",
+            )
+
+            self.assertTrue(
+                hasattr(collector, "configure_privacy"),
+                "collector does not persist the work-description privacy policy",
+            )
+            collector.configure_privacy(root, show_work_description=False)
+
+            policy = json.loads((root / "privacy.json").read_text())
+            self.assertIs(policy["showWorkDescription"], False)
+            for path in (root / "events/coder").glob("*.json"):
+                self.assertNotIn("workDescription", json.loads(path.read_text()))
+
+    def test_disabled_work_descriptions_are_suppressed_at_projection_boundary(self):
+        collector = load_collector()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "state"
+            write_record(
+                root,
+                "coder",
+                "legacy-running",
+                workDescription="legacy observer excerpt",
+            )
+
+            self.assertIn(
+                "include_work_descriptions",
+                inspect.signature(collector.build_snapshot).parameters,
+            )
+            snapshot = collector.build_snapshot(
+                root,
+                now=110,
+                online_sessions=[],
+                process_alive=lambda _pid, _start: True,
+                include_work_descriptions=False,
+            )
+
+            self.assertTrue(snapshot["onlineProfiles"])
+            self.assertTrue(
+                all("workDescription" not in row for row in snapshot["onlineProfiles"])
+            )
+
+    def test_public_snapshot_projects_minimal_dtos_without_internal_record_fields(self):
+        collector = load_collector()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "state"
+            write_record(
+                root,
+                "coder",
+                "public-event",
+                state="failed",
+                finishedAt=200.0,
+                durationSec=100.0,
+                taskId="task-private",
+                turnId="turn-private",
+                writerPid=999,
+                writerProcessStart="1234",
+                exitReason="raw-provider-reason",
+                contextApiRequestId="request-private",
+            )
+
+            snapshot = collector.build_snapshot(root, now=201.0, online_sessions=[])
+            snapshot["pendingNotifications"] = collector.pending_notifications(
+                root,
+                snapshot,
+                now=201.0,
+                min_duration_sec=0,
+            )
+            snapshot.pop("_notificationCandidates", None)
+
+            expected = {"eventId", "profile", "state", "durationSec", "finishedAt"}
+            self.assertEqual(set(snapshot["recent"][0]), expected)
+            self.assertEqual(set(snapshot["pendingNotifications"][0]), expected)
+            forbidden = {
+                "writerPid",
+                "writerProcessStart",
+                "taskId",
+                "turnId",
+                "exitReason",
+                "contextApiRequestId",
+            }
+
+            def keys(value):
+                if isinstance(value, dict):
+                    return set(value).union(*(keys(item) for item in value.values()))
+                if isinstance(value, list):
+                    return set().union(*(keys(item) for item in value)) if value else set()
+                return set()
+
+            self.assertTrue(forbidden.isdisjoint(keys(snapshot)))
+
+    def test_pending_notification_batch_is_bounded_before_qml_projection(self):
+        collector = load_collector()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "state"
+            candidates = [
+                {
+                    "eventId": f"event-{index}",
+                    "profile": "default",
+                    "state": "succeeded",
+                    "startedAt": float(index),
+                    "finishedAt": float(index + 10),
+                    "durationSec": 10.0,
+                }
+                for index in reversed(range(150))
+            ]
+
+            pending = collector.pending_notifications(
+                root,
+                {"_notificationCandidates": candidates},
+                now=200.0,
+                min_duration_sec=0,
+                max_catchup_age_sec=1000,
+            )
+
+            self.assertLessEqual(len(pending), 100)
+            self.assertEqual(
+                [record["eventId"] for record in pending],
+                [f"event-{index}" for index in range(100)],
+            )
+            collector.acknowledge(root, "event-0")
+            next_page = collector.pending_notifications(
+                root,
+                {"_notificationCandidates": candidates},
+                now=200.0,
+                min_duration_sec=0,
+                max_catchup_age_sec=1000,
+            )
+            self.assertEqual(next_page[-1]["eventId"], "event-100")
+
+    def test_snapshot_cache_reuses_unchanged_events_avatars_and_session_databases(self):
+        collector = load_collector()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "state"
+            hermes_root = Path(tmp) / "hermes"
+            write_record(
+                root,
+                "default",
+                "cached-event",
+                state="succeeded",
+                finishedAt=900.0,
+                durationSec=800.0,
+            )
+            write_session_db(
+                hermes_root / "state.db",
+                [{"id": "cached-session", "title": "Cached session"}],
+            )
+            assets = hermes_root / "assets"
+            assets.mkdir()
+            (assets / "avatar.png").write_bytes(b"\x89PNG\r\n\x1a\ncached")
+            self.assertTrue(
+                hasattr(collector, "SnapshotCache"),
+                "collector does not provide persistent snapshot caching",
+            )
+            cache = collector.SnapshotCache()
+            real_read_json = collector._read_json
+            self.assertTrue(
+                hasattr(collector, "_read_avatar_header"),
+                "avatar cache is not keyed from a validated descriptor",
+            )
+            real_avatar_header = collector._read_avatar_header
+            real_connect = collector.sqlite3.connect
+            with (
+                mock.patch.dict(os.environ, {"HERMES_ROOT": str(hermes_root)}),
+                mock.patch.object(collector, "_read_json", wraps=real_read_json) as read_json,
+                mock.patch.object(
+                    collector,
+                    "_read_avatar_header",
+                    wraps=real_avatar_header,
+                ) as avatar_header,
+                mock.patch.object(collector.sqlite3, "connect", wraps=real_connect) as connect,
+            ):
+                first = collector.build_snapshot(root, now=1000.0, cache=cache, online_sessions=[])
+                first_counts = (read_json.call_count, avatar_header.call_count, connect.call_count)
+                second = collector.build_snapshot(root, now=1001.0, cache=cache, online_sessions=[])
+
+            self.assertEqual(first["recent"][0]["eventId"], "cached-event")
+            self.assertEqual(second["recentSessions"][0]["sessionId"], "cached-session")
+            self.assertEqual(avatar_header.call_count, 1)
+            self.assertEqual(
+                (read_json.call_count, avatar_header.call_count, connect.call_count),
+                first_counts,
+            )
+
+    def test_avatar_cache_refreshes_recent_rows_without_reopening_unchanged_database(self):
+        collector = load_collector()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "state"
+            hermes_root = Path(tmp) / "hermes"
+            write_session_db(
+                hermes_root / "state.db",
+                [{"id": "avatar-session", "title": "Avatar session"}],
+            )
+            assets = hermes_root / "assets"
+            assets.mkdir()
+            avatar = assets / "avatar.png"
+            avatar.write_bytes(b"\x89PNG\r\n\x1a\nfirst")
+            cache = collector.SnapshotCache()
+            real_connect = collector.sqlite3.connect
+            with (
+                mock.patch.dict(os.environ, {"HERMES_ROOT": str(hermes_root)}),
+                mock.patch.object(collector.sqlite3, "connect", wraps=real_connect) as connect,
+            ):
+                first = collector.build_snapshot(root, now=100.0, cache=cache, online_sessions=[])
+                original_mtime = avatar.stat().st_mtime_ns
+                replacement = assets / "replacement.png"
+                replacement.write_bytes(b"\x89PNG\r\n\x1a\nother")
+                os.utime(replacement, ns=(original_mtime, original_mtime))
+                replacement.replace(avatar)
+                second = collector.build_snapshot(root, now=101.0, cache=cache, online_sessions=[])
+
+            self.assertEqual(connect.call_count, 1)
+            self.assertNotEqual(
+                first["recentSessions"][0]["avatarUrl"],
+                second["recentSessions"][0]["avatarUrl"],
+            )
+
     def test_snapshot_lists_only_the_six_latest_titled_local_sessions_across_profiles(self):
         collector = load_collector()
         with tempfile.TemporaryDirectory() as tmp:
@@ -1119,6 +1637,37 @@ class CollectorTests(unittest.TestCase):
             )
 
             self.assertIs(snapshot["onlineProfiles"][0]["observerLoaded"], True)
+            self.assertIs(
+                snapshot["onlineProfiles"][0].get("workDescriptionPolicyLoaded", False),
+                False,
+            )
+            (directory / f"{identity}.json").write_text(
+                json.dumps(
+                    {
+                        "schemaVersion": 1,
+                        "profile": profile,
+                        "writerPid": pid,
+                        "writerProcessStart": process_start,
+                        "capabilities": ["work-description-policy-v1"],
+                    }
+                )
+            )
+            upgraded = collector.build_snapshot(
+                root,
+                now=101.0,
+                online_sessions=[
+                    {
+                        "profile": profile,
+                        "pid": pid,
+                        "processStart": process_start,
+                        "runningForSec": 51.0,
+                    }
+                ],
+            )
+            self.assertIs(
+                upgraded["onlineProfiles"][0].get("workDescriptionPolicyLoaded"),
+                True,
+            )
 
     def test_online_session_key_is_stable_across_poll_updates_and_hides_process_identity(self):
         collector = load_collector()
@@ -1249,6 +1798,310 @@ class CollectorTests(unittest.TestCase):
                 )
 
             self.assertNotIn("avatarUrl", snapshot["onlineProfiles"][0])
+
+    def test_snapshot_rejects_a_hardlinked_profile_avatar(self):
+        collector = load_collector()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "state"
+            hermes_root = Path(tmp) / "hermes"
+            assets = hermes_root / "profiles" / "coder" / "assets"
+            assets.mkdir(parents=True)
+            outside = Path(tmp) / "outside.png"
+            outside.write_bytes(b"\x89PNG\r\n\x1a\nprivate-image")
+            os.link(outside, assets / "avatar.png")
+
+            with mock.patch.dict(os.environ, {"HERMES_ROOT": str(hermes_root)}):
+                snapshot = collector.build_snapshot(
+                    root,
+                    now=100.0,
+                    online_sessions=[{"profile": "coder", "pid": 11, "runningForSec": 50.0}],
+                )
+
+            self.assertNotIn("avatarUrl", snapshot["onlineProfiles"][0])
+
+    def test_avatar_parent_swap_cannot_redirect_the_validated_file(self):
+        collector = load_collector()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "state"
+            hermes_root = Path(tmp) / "hermes"
+            assets = hermes_root / "profiles/coder/assets"
+            assets.mkdir(parents=True)
+            avatar = assets / "avatar.png"
+            avatar.write_bytes(b"\x89PNG\r\n\x1a\nsafe")
+            safe_inode = avatar.stat().st_ino
+            outside = Path(tmp) / "outside-assets"
+            outside.mkdir()
+            (outside / "avatar.png").write_bytes(b"\x89PNG\r\n\x1a\nprivate")
+            moved = Path(tmp) / "moved-assets"
+            original_stat = Path.stat
+            swapped = False
+
+            def swap_after_assets_check(path, *args, **kwargs):
+                nonlocal swapped
+                metadata = original_stat(path, *args, **kwargs)
+                if path == assets and not swapped:
+                    swapped = True
+                    assets.rename(moved)
+                    assets.symlink_to(outside, target_is_directory=True)
+                return metadata
+
+            with (
+                mock.patch.dict(os.environ, {"HERMES_ROOT": str(hermes_root)}),
+                mock.patch.object(Path, "stat", swap_after_assets_check),
+            ):
+                avatar_url = collector._profile_avatar_url(
+                    "coder",
+                    hermes_root=hermes_root,
+                )
+
+            self.assertIn(f"-{safe_inode}-", avatar_url)
+
+    def test_avatar_swap_after_open_returns_the_descriptor_pinned_path(self):
+        collector = load_collector()
+        with tempfile.TemporaryDirectory() as tmp:
+            hermes_root = Path(tmp) / "hermes"
+            assets = hermes_root / "profiles/coder/assets"
+            assets.mkdir(parents=True)
+            (assets / "avatar.png").write_bytes(b"\x89PNG\r\n\x1a\nsafe")
+            outside = Path(tmp) / "outside-assets"
+            outside.mkdir()
+            (outside / "avatar.png").write_bytes(b"\x89PNG\r\n\x1a\nprivate")
+            moved = Path(tmp) / "moved-assets"
+            original_read = collector.os.read
+            swapped = False
+
+            def swap_after_open(descriptor, size):
+                nonlocal swapped
+                payload = original_read(descriptor, size)
+                if not swapped:
+                    swapped = True
+                    assets.rename(moved)
+                    assets.symlink_to(outside, target_is_directory=True)
+                return payload
+
+            with mock.patch.object(collector.os, "read", side_effect=swap_after_open):
+                avatar_url = collector._profile_avatar_url(
+                    "coder",
+                    hermes_root=hermes_root,
+                )
+
+            self.assertIn("/moved-assets/avatar.png", avatar_url)
+            self.assertNotIn("/outside-assets/", avatar_url)
+
+    def test_recent_session_database_is_opened_through_a_validated_descriptor(self):
+        collector = load_collector()
+        with tempfile.TemporaryDirectory() as tmp:
+            hermes_root = Path(tmp) / "hermes"
+            database_path = hermes_root / "state.db"
+            hermes_root.mkdir()
+            write_session_db(
+                database_path,
+                [
+                    {
+                        "id": "session-safe",
+                        "title": "Safe session",
+                        "source": "cli",
+                        "started_at": 10,
+                    }
+                ],
+            )
+            real_connect = collector.sqlite3.connect
+            with mock.patch.object(
+                collector.sqlite3,
+                "connect",
+                wraps=real_connect,
+            ) as connect:
+                rows = collector._profile_recent_sessions(
+                    "default",
+                    hermes_root=hermes_root,
+                    limit=6,
+                )
+
+            self.assertEqual([row["sessionId"] for row in rows], ["session-safe"])
+            database_uri = connect.call_args.args[0]
+            self.assertTrue(database_uri.startswith("file:///proc/self/fd/"))
+
+    def test_recent_session_database_rejects_hardlinks_without_leaking_descriptors(self):
+        collector = load_collector()
+        with tempfile.TemporaryDirectory() as tmp:
+            hermes_root = Path(tmp) / "hermes"
+            hermes_root.mkdir()
+            outside = Path(tmp) / "outside.db"
+            write_session_db(
+                outside,
+                [
+                    {
+                        "id": "session-private",
+                        "title": "Private session",
+                        "source": "cli",
+                        "started_at": 10,
+                    }
+                ],
+            )
+            os.link(outside, hermes_root / "state.db")
+            descriptor_count = len(list(Path("/proc/self/fd").iterdir()))
+
+            for _ in range(10):
+                self.assertEqual(
+                    collector._profile_recent_sessions(
+                        "default",
+                        hermes_root=hermes_root,
+                        limit=6,
+                    ),
+                    [],
+                )
+
+            self.assertEqual(len(list(Path("/proc/self/fd").iterdir())), descriptor_count)
+
+    def test_recent_session_cache_revalidates_profile_directory_before_a_hit(self):
+        collector = load_collector()
+        with tempfile.TemporaryDirectory() as tmp:
+            hermes_root = Path(tmp) / "hermes"
+            profile_dir = hermes_root / "profiles/coder"
+            profile_dir.mkdir(parents=True)
+            write_session_db(
+                profile_dir / "state.db",
+                [
+                    {
+                        "id": "session-cached",
+                        "title": "Cached session",
+                        "source": "cli",
+                        "started_at": 10,
+                    }
+                ],
+            )
+            cache = collector.SnapshotCache()
+            self.assertTrue(
+                collector._profile_recent_sessions(
+                    "coder",
+                    hermes_root=hermes_root,
+                    limit=6,
+                    cache=cache,
+                )
+            )
+            moved = Path(tmp) / "moved-coder"
+            profile_dir.rename(moved)
+            profile_dir.symlink_to(moved, target_is_directory=True)
+
+            rows = collector._profile_recent_sessions(
+                "coder",
+                hermes_root=hermes_root,
+                limit=6,
+                cache=cache,
+            )
+
+            self.assertEqual(rows, [])
+
+    def test_recent_session_cache_keys_the_descriptor_opened_after_a_path_swap(self):
+        collector = load_collector()
+        with tempfile.TemporaryDirectory() as tmp:
+            hermes_root = Path(tmp) / "hermes"
+            hermes_root.mkdir()
+            database_path = hermes_root / "state.db"
+            write_session_db(
+                database_path,
+                [
+                    {
+                        "id": "session-old",
+                        "title": "Old session",
+                        "source": "cli",
+                        "started_at": 10,
+                    }
+                ],
+            )
+            cache = collector.SnapshotCache()
+            collector._profile_recent_sessions(
+                "default",
+                hermes_root=hermes_root,
+                limit=6,
+                cache=cache,
+            )
+            replacement = Path(tmp) / "replacement.db"
+            write_session_db(
+                replacement,
+                [
+                    {
+                        "id": "session-new",
+                        "title": "New session",
+                        "source": "cli",
+                        "started_at": 20,
+                    }
+                ],
+            )
+
+            original_open = collector.os.open
+
+            def swap_before_open(path, flags, *args, **kwargs):
+                if path == "state.db" and replacement.exists():
+                    os.replace(replacement, database_path)
+                return original_open(path, flags, *args, **kwargs)
+
+            with mock.patch.object(
+                collector.os,
+                "open",
+                side_effect=swap_before_open,
+            ):
+                rows = collector._profile_recent_sessions(
+                    "default",
+                    hermes_root=hermes_root,
+                    limit=6,
+                    cache=cache,
+                )
+
+            self.assertEqual([row["sessionId"] for row in rows], ["session-new"])
+
+    def test_recent_session_parent_swap_cannot_redirect_database_open(self):
+        collector = load_collector()
+        with tempfile.TemporaryDirectory() as tmp:
+            hermes_root = Path(tmp) / "hermes"
+            profile_dir = hermes_root / "profiles/coder"
+            profile_dir.mkdir(parents=True)
+            write_session_db(
+                profile_dir / "state.db",
+                [
+                    {
+                        "id": "session-safe",
+                        "title": "Safe session",
+                        "source": "cli",
+                        "started_at": 10,
+                    }
+                ],
+            )
+            outside = Path(tmp) / "outside"
+            outside.mkdir()
+            write_session_db(
+                outside / "state.db",
+                [
+                    {
+                        "id": "session-private",
+                        "title": "Private session",
+                        "source": "cli",
+                        "started_at": 20,
+                    }
+                ],
+            )
+            moved = Path(tmp) / "moved-coder"
+            original_stat = Path.stat
+            swapped = False
+
+            def swap_after_profile_check(path, *args, **kwargs):
+                nonlocal swapped
+                metadata = original_stat(path, *args, **kwargs)
+                if path == profile_dir and not swapped:
+                    swapped = True
+                    profile_dir.rename(moved)
+                    profile_dir.symlink_to(outside, target_is_directory=True)
+                return metadata
+
+            with mock.patch.object(Path, "stat", swap_after_profile_check):
+                rows = collector._profile_recent_sessions(
+                    "coder",
+                    hermes_root=hermes_root,
+                    limit=6,
+                    avatar_url="",
+                )
+
+            self.assertEqual([row["sessionId"] for row in rows], ["session-safe"])
 
     def test_idle_online_profile_reuses_latest_confirmed_context(self):
         collector = load_collector()
@@ -1637,6 +2490,39 @@ class CollectorTests(unittest.TestCase):
             remaining = {path.stem for path in (root / "events/coder").glob("*.json")}
             self.assertEqual(remaining, {"running", "done-2", "done-3"})
 
+    def test_prune_bounds_terminal_history_by_age_as_well_as_count(self):
+        collector = load_collector()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            now = 4_000_000.0
+            write_record(
+                root,
+                "coder",
+                "expired",
+                state="succeeded",
+                finishedAt=now - 31 * 86400,
+                durationSec=10.0,
+            )
+            write_record(
+                root,
+                "coder",
+                "retained",
+                state="succeeded",
+                finishedAt=now - 86400,
+                durationSec=10.0,
+            )
+
+            with mock.patch.object(collector.time, "time", return_value=now):
+                deleted = collector.prune(
+                    root,
+                    keep_terminal=100,
+                    max_age_sec=30 * 86400,
+                )
+
+            self.assertEqual(deleted, 1)
+            remaining = {path.stem for path in (root / "events/coder").glob("*.json")}
+            self.assertEqual(remaining, {"retained"})
+
     def test_prune_ignores_valid_non_object_json_records(self):
         collector = load_collector()
         with tempfile.TemporaryDirectory() as tmp:
@@ -2023,7 +2909,7 @@ class CollectorTests(unittest.TestCase):
 
             self.assertEqual(snapshot["activeBotCount"], 0)
             self.assertEqual(snapshot["recent"][0]["state"], "stale")
-            self.assertEqual(snapshot["recent"][0]["exitReason"], "writer_process_exited")
+            self.assertNotIn("exitReason", snapshot["recent"][0])
 
     def test_stale_transition_is_persisted_once_for_history_and_pruning(self):
         collector = load_collector()

@@ -3,8 +3,10 @@ import json
 import os
 import sys
 import tempfile
+import threading
 import types
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from unittest import mock
 
@@ -39,6 +41,95 @@ class FakeContext:
 
 
 class ObserverLifecycleTests(unittest.TestCase):
+    def test_privacy_disable_linearizes_with_an_inflight_turn_start(self):
+        from tests.test_collector import load_collector
+
+        observer = load_observer()
+        collector = load_collector()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "omarchy/hermes-bots"
+            policy_read = threading.Event()
+            continue_write = threading.Event()
+            shared_lock = threading.Lock()
+            real_policy_read = observer._show_work_description
+
+            def delayed_policy_read():
+                selected = real_policy_read()
+                policy_read.set()
+                continue_write.wait(timeout=2)
+                return selected
+
+            @contextmanager
+            def synchronized_lock(*_args, **_kwargs):
+                with shared_lock:
+                    yield
+
+            def start_turn():
+                with mock.patch.dict(
+                    os.environ,
+                    {"XDG_STATE_HOME": tmp, "HERMES_HOME": "/tmp/hermes/profiles/coder"},
+                ), mock.patch.object(
+                    observer, "_show_work_description", side_effect=delayed_policy_read
+                ), mock.patch.object(observer, "_privacy_lock", synchronized_lock):
+                    observer.on_turn_start(
+                        session_id="session-race",
+                        turn_id="turn-race",
+                        user_message="Private race description",
+                    )
+
+            thread = threading.Thread(target=start_turn)
+            thread.start()
+            self.assertTrue(policy_read.wait(timeout=2))
+            with mock.patch.object(collector, "_privacy_policy_lock", synchronized_lock):
+                privacy_thread = threading.Thread(
+                    target=collector.configure_privacy,
+                    args=(root,),
+                    kwargs={"show_work_description": False},
+                )
+                privacy_thread.start()
+                continue_write.set()
+                privacy_thread.join(timeout=2)
+                self.assertFalse(privacy_thread.is_alive())
+            thread.join(timeout=2)
+            self.assertFalse(thread.is_alive())
+
+            record = json.loads(
+                next((root / "events/coder").glob("*.json")).read_text()
+            )
+            self.assertNotIn("workDescription", record)
+
+    def test_observer_bounds_all_persisted_hook_strings(self):
+        observer = load_observer()
+        with tempfile.TemporaryDirectory() as tmp:
+            long_value = "x" * 5000
+            with mock.patch.dict(
+                os.environ,
+                {"XDG_STATE_HOME": tmp, "HERMES_HOME": "/tmp/hermes/profiles/coder"},
+            ):
+                observer.on_turn_start(
+                    session_id=long_value,
+                    turn_id=long_value,
+                    task_id=long_value,
+                    model=long_value,
+                    platform=long_value,
+                )
+                observer.on_turn_end(
+                    session_id=long_value,
+                    turn_id=long_value,
+                    failed=True,
+                    turn_exit_reason=long_value,
+                )
+
+            record = json.loads(
+                next((Path(tmp) / "omarchy/hermes-bots/events/coder").glob("*.json")).read_text()
+            )
+            self.assertLessEqual(len(record["sessionId"]), 128)
+            self.assertLessEqual(len(record["turnId"]), 128)
+            self.assertLessEqual(len(record["taskId"]), 128)
+            self.assertLessEqual(len(record["model"]), 200)
+            self.assertLessEqual(len(record["platform"]), 100)
+            self.assertLessEqual(len(record["exitReason"]), 200)
+
     def test_observer_registration_writes_process_handshake(self):
         observer = load_observer()
         with tempfile.TemporaryDirectory() as tmp:
@@ -60,6 +151,7 @@ class ObserverLifecycleTests(unittest.TestCase):
                     "profile": "coder",
                     "writerPid": 123,
                     "writerProcessStart": "456",
+                    "capabilities": ["work-description-policy-v1"],
                 },
             )
 
@@ -644,6 +736,29 @@ class ObserverLifecycleTests(unittest.TestCase):
                 self.assertGreaterEqual(data["finishedAt"], data["startedAt"])
                 self.assertNotIn("SECRET RESPONSE", record.read_text())
 
+    def test_turn_end_removes_the_work_description_from_terminal_history(self):
+        observer = load_observer()
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.dict(
+                os.environ,
+                {"XDG_STATE_HOME": tmp, "HERMES_HOME": "/tmp/hermes/profiles/coder"},
+            ):
+                observer.on_turn_start(
+                    session_id="session-terminal",
+                    turn_id="turn-terminal",
+                    user_message="Temporary work description",
+                )
+                observer.on_turn_end(
+                    session_id="session-terminal",
+                    turn_id="turn-terminal",
+                    completed=True,
+                )
+
+            record = json.loads(
+                next((Path(tmp) / "omarchy/hermes-bots/events/coder").glob("*.json")).read_text()
+            )
+            self.assertNotIn("workDescription", record)
+
     def test_turn_start_writes_bounded_work_description_without_history(self):
         observer = load_observer()
         with tempfile.TemporaryDirectory() as tmp:
@@ -685,6 +800,45 @@ class ObserverLifecycleTests(unittest.TestCase):
                 else:
                     os.environ["HERMES_HOME"] = old_home
 
+    def test_disabled_work_description_policy_prevents_prompt_persistence(self):
+        observer = load_observer()
+        with tempfile.TemporaryDirectory() as tmp:
+            state_root = Path(tmp) / "omarchy/hermes-bots"
+            state_root.mkdir(parents=True)
+            (state_root / "privacy.json").write_text(
+                json.dumps({"schemaVersion": 1, "showWorkDescription": False})
+            )
+            with mock.patch.dict(
+                os.environ,
+                {"XDG_STATE_HOME": tmp, "HERMES_HOME": "/tmp/hermes/profiles/coder"},
+            ):
+                observer.on_turn_start(
+                    session_id="session-private",
+                    turn_id="turn-private",
+                    user_message="Private request text",
+                )
+
+            record = json.loads(
+                next((state_root / "events/coder").glob("*.json")).read_text()
+            )
+            self.assertNotIn("workDescription", record)
+            record_path = next((state_root / "events/coder").glob("*.json"))
+            record["workDescription"] = "Legacy description"
+            record_path.write_text(json.dumps(record))
+            with mock.patch.dict(
+                os.environ,
+                {"XDG_STATE_HOME": tmp, "HERMES_HOME": "/tmp/hermes/profiles/coder"},
+            ):
+                observer.on_turn_start(
+                    session_id="session-private",
+                    turn_id="turn-private",
+                    user_message="Another private request",
+                )
+            self.assertNotIn(
+                "workDescription",
+                json.loads(record_path.read_text()),
+            )
+
     def test_work_description_is_plain_text_and_bounded(self):
         observer = load_observer()
 
@@ -694,6 +848,48 @@ class ObserverLifecycleTests(unittest.TestCase):
         )
         self.assertEqual(len(observer._work_description("x" * 500)), 160)
         self.assertEqual(observer._work_description({"prompt": "private"}), "")
+        sensitive_value = "credential-" + "sentinel"
+        filtered = observer._work_description(f"Deploy password={sensitive_value}")
+        self.assertNotIn(sensitive_value, filtered)
+        self.assertEqual(filtered, "Deploy password=[REDACTED]")
+        authorization = observer._work_description(
+            f"Call Authorization: Basic {sensitive_value} now"
+        )
+        self.assertNotIn(sensitive_value, authorization)
+        self.assertEqual(authorization, "Call Authorization:[REDACTED]")
+        spaced_secret = observer._work_description(
+            f"Deploy password={sensitive_value} second-word; continue"
+        )
+        self.assertNotIn("second-word", spaced_secret)
+        self.assertEqual(spaced_secret, "Deploy password=[REDACTED]")
+        digest = observer._work_description(
+            f"Call Authorization: Digest username={sensitive_value}, nonce=second-word"
+        )
+        self.assertNotIn(sensitive_value, digest)
+        self.assertNotIn("second-word", digest)
+        self.assertEqual(digest, "Call Authorization:[REDACTED]")
+        quoted = observer._work_description(
+            f'Deploy password="{sensitive_value},second-word"; continue'
+        )
+        self.assertNotIn(sensitive_value, quoted)
+        self.assertNotIn("second-word", quoted)
+        self.assertEqual(quoted, "Deploy password=[REDACTED]")
+        semicolon_secret = observer._work_description(
+            f'Deploy password="{sensitive_value};second-word"'
+        )
+        self.assertNotIn(sensitive_value, semicolon_secret)
+        self.assertNotIn("second-word", semicolon_secret)
+        for key in (
+            "OPENAI_API_KEY",
+            "CLIENT_SECRET",
+            "REFRESH_TOKEN",
+            "AWS_SECRET_ACCESS_KEY",
+        ):
+            with self.subTest(key=key):
+                filtered_name = observer._work_description(
+                    f"Deploy {key}={sensitive_value}"
+                )
+                self.assertNotIn(sensitive_value, filtered_name)
 
     def test_repeated_turn_start_preserves_the_original_start_time(self):
         observer = load_observer()

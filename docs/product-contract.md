@@ -13,7 +13,7 @@ This document records the product and compatibility decisions that guide the 0.x
 
 Profile filtering applies to every Watcher-visible profile surface: activity, notifications, available-profile launchers, avatars, and recent-session metadata. A separate display filter should be introduced if launchers ever need broader scope.
 
-Task descriptions remain enabled by default for the 0.x series because live work identification is a core feature. A later privacy milestone must add a setting that prevents collection and persistence, rather than merely hiding descriptions after collection.
+Task descriptions remain enabled by default for the 0.x series because live work identification is a core feature. Milestone 4 privacy controls now allow collection to be disabled before observer persistence, purge existing excerpts, redact credential-like values, report older observers that require restart, and independently disable recent-title database access. Public snapshot DTOs expose only documented consumer fields, enforce item schemas and a 256 KiB total budget, and retain terminal Watcher history for at most 100 records and 30 days.
 
 ## Panel semantics
 
@@ -32,4 +32,4 @@ Compatibility-sensitive Hermes integrations must be isolated and tested against 
 
 ## Performance target
 
-Idle performance target: no Python interpreter launch every two seconds and no more than 0.25% of one CPU core on the reference system while the panel is closed. This is Milestone 3 future work, not a Milestones 0–2 acceptance criterion; the current collector still uses bounded polling. Active updates should remain visible within two seconds unless the user configures a slower interval.
+Idle performance target: no Python interpreter launch every two seconds and no more than 0.25% of one CPU core on the reference system while the panel is closed. Milestone 3 is implemented with one persistent inotify-driven collector, cached immutable inputs, an independent 30-second health scan, and a two-second fallback only when event coverage is unavailable or an active stale-writer deadline requires it. Active lifecycle updates remain event-driven and should appear within two seconds. An executable regression test enforces the CPU target, one-process/no-descendant contract, bounded scheduler wakeups, and a 64 MiB RSS ceiling.

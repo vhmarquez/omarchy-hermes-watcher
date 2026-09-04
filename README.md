@@ -6,7 +6,7 @@ A local-only Omarchy Shell service and bar widget that tracks turns from local H
 
 - `hermes-plugin/`: opt-in Hermes observer using documented turn and API lifecycle hooks.
 - `hermes_bot_status.py`: validates and aggregates records, detects open Hermes processes and stale writers, reads bounded session metadata for recent-session launchers, persists notification delivery claims and acknowledgements, and prunes history.
-- `Service.qml`: persistent Omarchy Shell service that polls the collector and asks the collector to deliver notifications with `notify-send` argv and the bundled Hermes Watcher icon (never a shell string).
+- `Service.qml`: persistent Omarchy Shell service that keeps one event-driven collector process, validates its NDJSON stream, and asks the collector to deliver notifications with `notify-send` argv and the bundled Hermes Watcher icon (never a shell string).
 - `BarWidget.qml`: online-session badge and panel with one Agent card per open Hermes session, each profile's native Bot Mode avatar, current work descriptions, live context pressure, one-click launchers for every local profile, and up to six resumable recent sessions. Its menu-bar branding uses the official Hermes Agent favicon SVG, tinted to the active Omarchy foreground color.
 - `scripts/setup-profiles`: installs a stable observer copy under XDG data, then links and enables it for the default and every named local profile.
 - `scripts/remove-profiles`: disables the observer, removes only links created by setup, and removes the stable observer copy.
@@ -14,7 +14,7 @@ A local-only Omarchy Shell service and bar widget that tracks turns from local H
 
 ## Privacy and safety
 
-The observer stores profile name, opaque session/turn/task IDs, state, timestamps, model, the sanitized runtime reasoning-level label, platform, writer process identity, numeric context usage, and a whitespace-normalized excerpt of up to 160 characters from the current user request. That excerpt powers the Agent card's work description; the rest of the prompt is not stored. The collector reads only the minimum local `/proc` command prefix needed to recognize an interactive Hermes process and its explicit profile flag; it stops before one-shot prompts and resume names. For recent-session launchers, it opens each owner-controlled Hermes `state.db` read-only and selects only session ID, generated title, source, and activity timestamps; it never reads the messages table or transcript content. Snapshots expose one row per open session, profile names, uptime, context pressure, the bounded work description, profile avatars, and up to six recent local session titles plus the exact IDs required by Hermes resume. Launchable profiles must match Hermes' canonical lowercase profile-ID rules; reserved and tombstoned profiles are excluded. Avatar lookup accepts only an owner-controlled regular PNG, JPEG, or WebP file in the profile's `assets` directory, refuses symlinks, and opens special files non-blockingly. It does not store responses, tool arguments/results, conversation history, working directories, or credentials.
+The observer stores bounded internal lifecycle identifiers, state, timestamps, model, the sanitized runtime reasoning-level label, platform, writer process identity, numeric context usage, and—when `showWorkDescription` is enabled—a whitespace-normalized excerpt of up to 160 characters from the current user request. Credential-like assignments and bearer values are replaced with `[REDACTED]` before persistence. Disabling the setting prevents new excerpts, purges existing excerpts from Watcher state, and terminal records discard excerpts automatically. An older running Hermes process is reported as needing restart when it lacks this privacy capability. The collector reads only the minimum local `/proc` command prefix needed to recognize an interactive Hermes process and its explicit profile flag; it stops before one-shot prompts and resume names. When `showRecentSessionTitles` is enabled, it opens each owner-controlled Hermes `state.db` read-only and selects only the session ID, generated title, and activity timestamps; disabling the setting prevents all session-database access. It never reads the messages table or transcript content. Public snapshots use closed, minimal DTOs and never expose raw writer identity, task/turn IDs, request identifiers, or exit reasons. Every item and array is validated, and each serialized snapshot is bounded to 256 KiB.
 
 Records live under:
 
@@ -24,7 +24,7 @@ ${XDG_STATE_HOME:-~/.local/state}/omarchy/hermes-bots/
 
 Directories are mode `0700`; JSON records and consumer state are mode `0600`. Writes use atomic replacement and synchronize both the file and containing directory. Observer errors are logged and fail open so monitoring cannot block a Hermes turn.
 
-The plugin reads only bounded session metadata from `state.db` for the Recent launcher and does not read the messages table. To guarantee polling never creates or updates SQLite coordination files, every session query uses an immutable read of the latest checkpoint; newly written titles or activity can therefore appear after Hermes' next checkpoint rather than directly from an uncheckpointed WAL frame. The collector mirrors Hermes' user-visible session boundary by excluding delegated and internal children while retaining roots, branch/reset conversations, and resumable compression tips; a compression predecessor remains visible until an eligible tip exists. Invalid IDs, titles, and timestamps are rejected before result limits or continuation ranking. It does not register model-facing tools, inject prompts, alter approvals, edit Hermes `config.yaml`, or write to `/usr/share/omarchy`. Context-window capacity is resolved through Hermes' own model metadata resolver; no prompt, response, or credential is supplied to that lookup.
+The plugin reads only bounded session metadata from `state.db` for the Recent launcher and does not read the messages table. To guarantee collection never creates or updates SQLite coordination files, every session query uses an immutable read of the latest checkpoint; newly written titles or activity can therefore appear after Hermes' next checkpoint rather than directly from an uncheckpointed WAL frame. The collector mirrors Hermes' user-visible session boundary by excluding delegated and internal children while retaining roots, branch/reset conversations, and resumable compression tips; a compression predecessor remains visible until an eligible tip exists. Invalid IDs, titles, and timestamps are rejected before result limits or continuation ranking. It does not register model-facing tools, inject prompts, alter approvals, edit Hermes `config.yaml`, or write to `/usr/share/omarchy`. Context-window capacity is resolved through Hermes' own model metadata resolver; no prompt, response, or credential is supplied to that lookup.
 
 ## Source installation
 
@@ -42,18 +42,23 @@ On a clean Omarchy disable or removal, the service schedules observer cleanup au
 scripts/remove-profiles
 ```
 
-Terminal lifecycle history is automatically bounded to the 100 newest records during hourly pruning. Removing the plugin does not delete the separate lifecycle state directory.
+Terminal lifecycle history is automatically bounded to the 100 newest records and 30 days during hourly pruning. The panel's two-step **Clear Watcher history** action removes terminal Watcher records and their consumer entries while preserving running turns, observer handshakes, privacy policy, and all Hermes sessions in `state.db`. Removing the plugin does not delete the separate lifecycle state directory.
 
 `HERMES_ROOT` may be set for tests or nonstandard base-home layouts. It defaults to `~/.hermes`. The collector publishes its absolute launch root to the local service, which passes it to new terminals as an argv-safe `HERMES_HOME` environment assignment; this keeps a selected row and the resumed database aligned without shell interpolation. `XDG_STATE_HOME` and `XDG_DATA_HOME` are honored.
 
 ## Defaults
 
-- Poll every 2 seconds.
+- Use one persistent event-driven collector; lifecycle-file changes refresh immediately without launching another interpreter.
+- Run the default 30-second health scan across `/proc`, profiles, observers, avatars, and session-database signatures.
+- Use the 2-second `pollIntervalSec` only as a fallback when inotify coverage is unavailable and while checking active stale-writer deadlines.
+- Enforce the idle target of no more than 0.25% of one CPU core; the executable performance test also checks one process, no descendants, bounded wakeups, and at most 64 MiB RSS.
 - Notify on success and failure.
 - Do not notify on interruption or stale writer by default.
 - Suppress notifications for turns shorter than 5 seconds.
 - Catch up unacknowledged completions for at most 1 hour.
 - Show at most 6 recent local sessions.
+- Show work descriptions and recent session titles by default; both can be independently disabled.
+- Retain terminal Watcher history for at most 30 days and 100 records.
 - Monitor every instrumented profile unless `profileFilter` is set to a comma-separated list of profile IDs.
 - Mark a dead writer stale after a 30-second grace period; never infer success from a vanished process.
 - Use normal notification urgency so Omarchy Do Not Disturb remains effective.
@@ -72,9 +77,11 @@ Each Agent card uses the profile's canonical `assets/avatar.*` image. Hermes Des
 
 ```bash
 python3 hermes_bot_status.py snapshot
+python3 hermes_bot_status.py watch
 python3 hermes_bot_status.py initialize
 python3 hermes_bot_status.py acknowledge EVENT_ID
-python3 hermes_bot_status.py prune --keep-terminal 100
+python3 hermes_bot_status.py prune --keep-terminal 100 --max-age-sec 2592000
+python3 hermes_bot_status.py clear-history
 ```
 
 `initialize` acknowledges existing terminal history and is run by `setup-profiles`, preventing a first-install notification storm.
@@ -88,7 +95,7 @@ hermes plugins doctor --ci hermes-plugin
 omarchy plugin validate .
 ```
 
-The tests cover sanitized lifecycle writes, success/failure/interruption outcomes, hook failure isolation, stale/completion race handling, persistent delivery claims, real hung-process recovery, concurrent acknowledgements, stale-process persistence, recent-session metadata and limits, immutable SQLite sidecar races, Hermes-compatible delegate/branch/reset/compression boundaries, malformed pre-limit IDs/titles/timestamps, safe exact-session resume argv, profile filtering, history pruning, CLI JSON, Omarchy manifest/QML contracts, a real-Hermes isolated lifecycle round trip, an executable Quickshell service smoke test, and setup/removal behavior in temporary homes.
+The tests cover sanitized lifecycle writes, privacy-policy races, closed DTO validation, total payload bounds, event-driven streaming, persistent-process refresh and shutdown, cache invalidation, the idle CPU/RSS/wakeup budget, success/failure/interruption outcomes, persistent delivery claims, stale-process persistence, recent-session metadata and privacy controls, profile filtering, count-and-time retention, safe history clearing, lifecycle round trips, an executable Quickshell service smoke test, and setup/removal in temporary homes.
 
 ## MVP limitations
 

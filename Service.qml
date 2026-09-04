@@ -18,10 +18,19 @@ Item {
   property string acknowledgementError: ""
   property string consumerError: ""
   property string actionError: ""
+  property string historyError: ""
+  property string privacyError: ""
   property bool actionInProgress: false
+  property bool clearHistoryInProgress: false
   property int setupFailureCount: 0
   property int collectorFailureCount: 0
   property real collectorRetryAfter: 0
+  property real collectorLastOutputAt: 0
+  property bool collectorRestartRequested: false
+  property bool collectorRefreshPending: false
+  property bool collectorWanted: true
+  property int collectorWatchdogIntervalMs: (Math.max(5,
+    Number(setting("healthScanIntervalSec", 30))) * 2 + 5) * 1000
   property bool setupReady: false
   property bool setupReconciliation: false
   property var failedSetupProfiles: []
@@ -32,13 +41,14 @@ Item {
   property var notificationAttempts: ({})
   property var currentNotification: null
   property var retryNotification: null
+  property bool notificationEligibilityPending: true
   property var acknowledgementQueue: []
   property var acknowledgementAttempts: ({})
   property var acknowledgementRetryAfter: ({})
   property string ackEventId: ""
-  readonly property bool refreshing: snapshotProcess.running
+  readonly property bool refreshing: collectorRefreshPending
   readonly property string lastError: actionError || setupError || statusError
-    || notificationError || acknowledgementError || consumerError
+    || notificationError || acknowledgementError || consumerError || historyError || privacyError
 
   signal launchSucceeded()
 
@@ -71,15 +81,22 @@ Item {
     return states.join(",")
   }
 
-  function snapshotCommand() {
+  function collectorCommand() {
     var recentLimit = Math.min(6, Math.max(1, Number(setting("historyLimit", 6))))
-    return ["timeout", "5s", "python3", root.collectorPath, "snapshot",
+    var command = ["python3", "-B", root.collectorPath, "watch",
+      "--health-scan-sec", String(Math.max(5, Number(setting("healthScanIntervalSec", 30)))),
+      "--fallback-scan-sec", String(Math.max(1, Number(setting("pollIntervalSec", 2)))),
       "--history-limit", String(recentLimit),
       "--stale-grace-sec", String(setting("staleGraceSec", 30)),
       "--min-duration-sec", String(setting("notifyMinDurationSec", 5)),
       "--max-catchup-age-sec", String(setting("maxCatchupAgeSec", 3600)),
       "--profile-filter", String(setting("profileFilter", "")),
       "--notify-states", setting("notificationsEnabled", true) ? notificationStates() : ""]
+    command.push(setting("showWorkDescription", true)
+      ? "--show-work-description" : "--no-show-work-description")
+    command.push(setting("showRecentSessionTitles", true)
+      ? "--show-recent-session-titles" : "--no-show-recent-session-titles")
+    return command
   }
 
   function profileSetKey(profiles) {
@@ -134,10 +151,41 @@ Item {
       root.startSetup()
       return
     }
+    if (force === true) {
+      collectorRetryAfter = 0
+      collectorRetryTimer.stop()
+    }
     if (force !== true && Date.now() < collectorRetryAfter) return
-    if (!snapshotProcess.running) {
-      snapshotProcess.command = snapshotCommand()
-      snapshotProcess.running = true
+    if (collectorProcess.running) {
+      collectorRefreshPending = true
+      collectorProcess.write("refresh\n")
+      return
+    }
+    root.startCollector()
+  }
+
+  function startCollector() {
+    collectorWanted = true
+    if (!root.setupReady || collectorProcess.running) return
+    if (Date.now() < collectorRetryAfter) {
+      collectorRetryTimer.interval = Math.max(1, collectorRetryAfter - Date.now())
+      collectorRetryTimer.restart()
+      return
+    }
+    collectorProcess.command = collectorCommand()
+    collectorLastOutputAt = Date.now()
+    collectorProcess.running = true
+  }
+
+  function restartCollector() {
+    if (!root.setupReady) return
+    notificationEligibilityPending = true
+    if (collectorProcess.running) {
+      collectorRestartRequested = true
+      collectorProcess.signal(15)
+    } else {
+      collectorRetryAfter = 0
+      root.startCollector()
     }
   }
 
@@ -186,6 +234,33 @@ Item {
     return root.launchHermes(["hermes", "--profile", profile, "--resume", sessionId])
   }
 
+  function clearHistory() {
+    if (clearHistoryInProgress || clearHistoryProcess.running) return false
+    if (notifyProcess.running || ackProcess.running) {
+      historyError = "Wait for notification delivery before clearing history"
+      return false
+    }
+    historyError = ""
+    notificationRetryTimer.stop()
+    ackRetryTimer.stop()
+    notificationQueue = []
+    acknowledgementQueue = []
+    attemptedNotifications = ({})
+    notificationRetryAfter = ({})
+    notificationAttempts = ({})
+    acknowledgementRetryAfter = ({})
+    acknowledgementAttempts = ({})
+    currentNotification = null
+    retryNotification = null
+    ackEventId = ""
+    clearHistoryInProgress = true
+    clearHistoryProcess.command = [
+      "timeout", "30s", "python3", "-B", root.collectorPath, "clear-history"
+    ]
+    clearHistoryProcess.running = true
+    return true
+  }
+
   function addEventIds(values, valid) {
     for (var i = 0; i < values.length; i++) {
       if (values[i] && values[i].eventId) valid[String(values[i].eventId)] = true
@@ -200,10 +275,20 @@ Item {
 
   function compactNotificationState(parsed) {
     var valid = ({})
-    addEventIds(parsed.recent || [], valid)
-    addEventIds(parsed.pendingNotifications || [], valid)
-    addEventIds(notificationQueue || [], valid)
+    var pending = parsed.pendingNotifications || []
+    addEventIds(pending, valid)
+    var filteredQueue = []
+    for (var queueIndex = 0; queueIndex < notificationQueue.length; queueIndex++) {
+      var queued = notificationQueue[queueIndex]
+      if (queued && valid[String(queued.eventId)]) filteredQueue.push(queued)
+    }
+    notificationQueue = filteredQueue
     if (currentNotification && currentNotification.eventId) valid[String(currentNotification.eventId)] = true
+    if (retryNotification && !valid[String(retryNotification.eventId)]) {
+      delete attemptedNotifications[String(retryNotification.eventId)]
+      retryNotification = null
+      notificationRetryTimer.stop()
+    }
     if (retryNotification && retryNotification.eventId) valid[String(retryNotification.eventId)] = true
     for (var i = 0; i < acknowledgementQueue.length; i++) valid[String(acknowledgementQueue[i])] = true
     if (ackEventId !== "") valid[ackEventId] = true
@@ -214,21 +299,41 @@ Item {
     acknowledgementAttempts = compactMap(acknowledgementAttempts, valid)
   }
 
+  function updatePrivacyHealth(profiles) {
+    privacyError = ""
+    if (setting("showWorkDescription", true)) return
+    var rows = Array.isArray(profiles) ? profiles : []
+    for (var i = 0; i < rows.length; i++) {
+      if (rows[i] && rows[i].observerLoaded === true
+          && rows[i].workDescriptionPolicyLoaded !== true) {
+        privacyError = "Restart Hermes to enforce hidden work descriptions"
+        return
+      }
+    }
+  }
+
   function applySnapshot(raw) {
+    if (!collectorWanted || collectorRestartRequested) return
     var parsed = Model.parseSnapshot(raw)
     if (!parsed.ok) {
       recordCollectorFailure(parsed.lastError || "Hermes Watcher status unavailable")
       return
     }
-    status = parsed
     hasSnapshot = true
+    collectorLastOutputAt = Date.now()
+    collectorRefreshPending = false
+    collectorWatchdogTimer.restart()
+    status = parsed
     lastSuccessfulSnapshotAt = Number(parsed.generatedAt || Date.now() / 1000)
     collectorFailureCount = 0
     collectorRetryAfter = 0
     statusError = ""
     consumerError = String(parsed.notificationError || "")
+    updatePrivacyHealth(parsed.onlineProfiles || [])
     reconcileProfiles(parsed.availableProfiles || [])
     compactNotificationState(parsed)
+    notificationEligibilityPending = false
+    if (clearHistoryInProgress) return
     if (!setting("notificationsEnabled", true)) return
     var pending = parsed.pendingNotifications || []
     var queue = notificationQueue.slice()
@@ -246,24 +351,19 @@ Item {
     startNextNotification()
   }
 
-  function finishSnapshot(exitCode, exitStatus, raw) {
-    if (exitCode !== 0 || exitStatus !== 0) {
-      recordCollectorFailure("Hermes Watcher collector failed")
-      return
-    }
-    applySnapshot(raw)
-  }
-
   function recordCollectorFailure(message) {
+    collectorRefreshPending = false
     collectorFailureCount += 1
     var delay = Math.min(60000, 1000 * Math.pow(2, Math.min(collectorFailureCount, 7) - 1))
     collectorRetryAfter = Date.now() + delay
     statusError = message
+    collectorRetryTimer.interval = delay
+    collectorRetryTimer.restart()
   }
 
   function startNextNotification() {
     if (acknowledgementQueue.length >= maxNotificationQueueDepth) return
-    if (!setting("notificationsEnabled", true) || retryNotification
+    if (notificationEligibilityPending || !setting("notificationsEnabled", true) || retryNotification
         || notifyProcess.running || currentNotification || notificationQueue.length === 0) return
     var queue = notificationQueue.slice()
     currentNotification = queue.shift()
@@ -420,12 +520,19 @@ Item {
     onTriggered: root.statusClockSec = Date.now() / 1000
   }
 
+  onSettingsChanged: if (root.setupReady) {
+    notificationEligibilityPending = true
+    root.restartCollector()
+  }
+
   Timer {
-    interval: Math.max(1, Number(root.setting("pollIntervalSec", 2))) * 1000
-    running: root.setupReady
-    repeat: true
-    triggeredOnStart: true
-    onTriggered: root.refresh()
+    id: collectorWatchdogTimer
+    interval: root.collectorWatchdogIntervalMs
+    repeat: false
+    onTriggered: {
+      root.statusError = "Hermes Watcher collector stopped responding"
+      collectorProcess.signal(15)
+    }
   }
 
   Timer {
@@ -460,7 +567,11 @@ Item {
     running: root.setupReady
     repeat: true
     onTriggered: if (!pruneProcess.running) {
-      pruneProcess.command = ["timeout", "30s", "python3", root.collectorPath, "prune", "--keep-terminal", "100"]
+      var retentionDays = Math.min(365, Math.max(1,
+        Number(root.setting("historyRetentionDays", 30))))
+      pruneProcess.command = ["timeout", "30s", "python3", "-B", root.collectorPath,
+        "prune", "--keep-terminal", "100", "--max-age-sec",
+        String(retentionDays * 86400)]
       pruneProcess.running = true
     }
   }
@@ -470,6 +581,12 @@ Item {
     interval: 30000
     repeat: false
     onTriggered: root.startSetup(root.setupReady)
+  }
+
+  Timer {
+    id: collectorRetryTimer
+    repeat: false
+    onTriggered: root.startCollector()
   }
 
   Process {
@@ -525,17 +642,46 @@ Item {
   }
 
   Process {
-    id: snapshotProcess
+    id: clearHistoryProcess
     running: false
-    command: ["timeout", "5s", "python3", root.collectorPath, "snapshot"]
-    stdout: StdioCollector {
-      id: snapshotStdout
-      waitForEnd: true
+    onExited: function(exitCode, exitStatus) {
+      root.clearHistoryInProgress = false
+      if (exitCode === 0 && exitStatus === 0) {
+        root.historyError = ""
+        root.refresh(true)
+      } else {
+        root.historyError = "Could not clear Hermes Watcher history"
+      }
     }
-    onExited: function(exitCode, exitStatus) { root.finishSnapshot(exitCode, exitStatus, snapshotStdout.text) }
     stderr: StdioCollector {
       waitForEnd: true
-      onStreamFinished: if (text.trim() !== "") console.warn("vhm.hermes-bots/snapshot", text.trim())
+      onStreamFinished: if (text.trim() !== "") console.warn("vhm.hermes-bots/history", text.trim())
+    }
+  }
+
+  Process {
+    id: collectorProcess
+    running: false
+    stdinEnabled: true
+    stdout: SplitParser {
+      onRead: function(line) { root.applySnapshot(line) }
+    }
+    stderr: SplitParser {
+      onRead: function(line) {
+        if (String(line).trim() !== "") console.warn("vhm.hermes-bots/collector", String(line).trim())
+      }
+    }
+    onStarted: collectorWatchdogTimer.restart()
+    onExited: function(exitCode, exitStatus) {
+      collectorWatchdogTimer.stop()
+      if (!root.collectorWanted) return
+      if (root.collectorRestartRequested) {
+        root.collectorRestartRequested = false
+        root.collectorRetryAfter = 0
+        root.startCollector()
+        return
+      }
+      root.recordCollectorFailure("Hermes Watcher collector exited unexpectedly")
     }
   }
 
@@ -566,7 +712,13 @@ Item {
     onExited: function(exitCode) { root.finishAcknowledgement(exitCode) }
   }
 
-  Component.onDestruction: if (root.autoStart) Quickshell.execDetached([root.cleanupScriptPath])
+  Component.onDestruction: {
+    root.collectorWanted = false
+    collectorRetryTimer.stop()
+    collectorWatchdogTimer.stop()
+    if (collectorProcess.running) collectorProcess.signal(15)
+    if (root.autoStart) Quickshell.execDetached([root.cleanupScriptPath])
+  }
 
   IpcHandler {
     target: "vhm.hermes-bots"
@@ -576,6 +728,9 @@ Item {
     function notificationsOff(): string { return root.setNotificationsEnabled(false) }
     function notificationsToggle(): string {
       return root.setNotificationsEnabled(!root.setting("notificationsEnabled", true))
+    }
+    function clearHistory(): string {
+      return root.clearHistory() ? "started" : "busy"
     }
   }
 }
