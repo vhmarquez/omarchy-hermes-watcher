@@ -39,6 +39,30 @@ class FakeContext:
 
 
 class ObserverLifecycleTests(unittest.TestCase):
+    def test_observer_registration_writes_process_handshake(self):
+        observer = load_observer()
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.dict(
+                os.environ,
+                {"XDG_STATE_HOME": tmp, "HERMES_HOME": "/tmp/hermes/profiles/coder"},
+            ), mock.patch.object(observer.os, "getpid", return_value=123), mock.patch.object(
+                observer, "_process_start", return_value="456"
+            ):
+                observer.record_observer_loaded()
+
+            records = list((Path(tmp) / "omarchy/hermes-bots/processes/coder").glob("*.json"))
+            self.assertEqual(len(records), 1)
+            record = json.loads(records[0].read_text())
+            self.assertEqual(
+                record,
+                {
+                    "schemaVersion": 1,
+                    "profile": "coder",
+                    "writerPid": 123,
+                    "writerProcessStart": "456",
+                },
+            )
+
     def test_context_resolver_rejects_hermes_unknown_model_fallback(self):
         observer = load_observer()
         fake_agent = types.ModuleType("agent")

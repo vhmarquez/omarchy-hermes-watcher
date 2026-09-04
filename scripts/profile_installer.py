@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import errno
 import os
+import re
 import secrets
 import stat
 
@@ -149,6 +150,11 @@ def install_data(data_parent, source_root):
         for directory, files in PAYLOADS.items():
             destination = child_dir(root, directory, True)
             try:
+                expected_modules = {
+                    Path(name).stem for name in files if name.endswith(".py")
+                }
+                if expected_modules:
+                    remove_python_cache(destination, expected_modules)
                 for name, mode in files.items():
                     atomic_file(destination, name,
                                 read_source(source_root, directory, name), mode)
@@ -232,6 +238,23 @@ def remove_profile_link(profile_home, observer_source):
         return "absent"
 
 
+def profile_link_status(profile_home, observer_source):
+    target = str(observer_source)
+    try:
+        with profile_plugins(profile_home) as plugins:
+            try:
+                metadata = os.stat("omarchy-bot-status", dir_fd=plugins, follow_symlinks=False)
+            except FileNotFoundError:
+                return "absent"
+            if not stat.S_ISLNK(metadata.st_mode):
+                return "unrelated"
+            if os.readlink("omarchy-bot-status", dir_fd=plugins) != target:
+                return "unrelated"
+            return "managed"
+    except FileNotFoundError:
+        return "absent"
+
+
 def unlink_regular(parent, name):
     fd = os.open(name, FF, dir_fd=parent)
     try:
@@ -239,6 +262,27 @@ def unlink_regular(parent, name):
     finally:
         os.close(fd)
     os.unlink(name, dir_fd=parent)
+
+
+def remove_python_cache(parent, expected_modules):
+    try:
+        cache = child_dir(parent, "__pycache__")
+    except FileNotFoundError:
+        return
+    try:
+        entries = set(os.listdir(cache))
+        allowed = re.compile(
+            rf"^(?:{'|'.join(re.escape(name) for name in sorted(expected_modules))})"
+            r"\.[A-Za-z0-9_.-]+\.pyc$"
+        )
+        unknown = {name for name in entries if allowed.fullmatch(name) is None}
+        if unknown:
+            raise OSError(errno.EPERM, f"unmanaged __pycache__ entries: {sorted(unknown)!r}")
+        for name in entries:
+            unlink_regular(cache, name)
+    finally:
+        os.close(cache)
+    os.rmdir("__pycache__", dir_fd=parent)
 
 
 def remove_data(data_parent):
@@ -257,6 +301,12 @@ def remove_data(data_parent):
                         continue
                     try:
                         entries = set(os.listdir(current))
+                        expected_modules = {
+                            Path(name).stem for name in allowed_modes if name.endswith(".py")
+                        }
+                        if "__pycache__" in entries and expected_modules:
+                            remove_python_cache(current, expected_modules)
+                            entries.remove("__pycache__")
                         unknown = entries - set(allowed_modes)
                         if unknown:
                             raise OSError(errno.EPERM,
@@ -289,6 +339,9 @@ def main():
     remove_link = commands.add_parser("remove-profile-link")
     remove_link.add_argument("profile_home", type=Path)
     remove_link.add_argument("observer_source", type=Path)
+    link_status = commands.add_parser("profile-link-status")
+    link_status.add_argument("profile_home", type=Path)
+    link_status.add_argument("observer_source", type=Path)
 
     for command in ("is-initialized", "mark-initialized", "remove-data"):
         sub = commands.add_parser(command)
@@ -300,6 +353,8 @@ def main():
         print(install_profile_link(args.profile_home, args.observer_source))
     elif args.command == "remove-profile-link":
         print(remove_profile_link(args.profile_home, args.observer_source))
+    elif args.command == "profile-link-status":
+        print(profile_link_status(args.profile_home, args.observer_source))
     elif args.command == "is-initialized":
         return 0 if initialized(args.data_parent) else 1
     elif args.command == "mark-initialized":

@@ -179,6 +179,7 @@ class ManagedTree:
                     remaining = remaining[written:]
                 os.fsync(temp_fd)
                 os.replace(temporary, relative[-1], src_dir_fd=fd, dst_dir_fd=fd)
+                os.fsync(fd)
             except BaseException:
                 try:
                     os.unlink(temporary, dir_fd=fd)

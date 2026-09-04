@@ -6,6 +6,7 @@ plugin_root="$(cd -- "$script_dir/.." && pwd -P)"
 hermes_root="${HERMES_ROOT:-$HOME/.hermes}"
 data_parent="${XDG_DATA_HOME:-$HOME/.local/share}"
 plugin_name="omarchy-bot-status"
+reserved_profiles=" hermes test tmp root sudo "
 
 lock_path="${XDG_RUNTIME_DIR:-/tmp}/vhm-hermes-bots-${UID}.lock"
 [[ ! -L "$lock_path" && ( ! -e "$lock_path" || -f "$lock_path" ) ]] || {
@@ -38,6 +39,13 @@ fi
 
 if [[ ${1:-} == "--if-disabled" ]]; then
   plugins="$(timeout 2 omarchy-shell shell listPlugins 2>/dev/null)" || exit 0
+  if ! jq -e --arg id "vhm.hermes-bots" '
+    type == "array"
+    and all(.[]; type == "object")
+    and all(map(select(.id == $id))[]; (.enabled | type) == "boolean")
+  ' <<<"$plugins" >/dev/null 2>&1; then
+    exit 0
+  fi
   if jq -e --arg id "vhm.hermes-bots" 'any(.[]; .id == $id and .enabled == true)' <<<"$plugins" >/dev/null; then
     exit 0
   fi
@@ -55,37 +63,60 @@ done
 remove_for_profile() {
   local profile="$1"
   local profile_home="$2"
+  local status
   local result
-  [[ "$profile" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,79}$ ]] || {
-    printf 'Ignoring unsafe Hermes profile name: %s\n' "$profile" >&2
+  [[ "$profile" == "default" || ( "$profile" =~ ^[a-z0-9][a-z0-9_-]{0,63}$
+    && "$reserved_profiles" != *" $profile "* ) ]] || {
+    printf 'Ignoring noncanonical Hermes profile name: %s\n' "$profile" >&2
     return 0
   }
-  result="$(python3 "$script_dir/profile_installer.py" remove-profile-link "$profile_home" "$observer_source")"
-  if [[ "$result" == "unrelated" ]]; then
+  if ! status="$(python3 "$script_dir/profile_installer.py" profile-link-status "$profile_home" "$observer_source")"; then
+    printf 'Could not inspect observer link for Hermes profile: %s\n' "$profile" >&2
+    return 1
+  fi
+  if [[ "$status" == "unrelated" ]]; then
     printf 'Left unrelated profile plugin path untouched: %s\n' "$profile_home/plugins/$plugin_name" >&2
     return 0
   fi
-  [[ "$result" == "removed" ]] || return 0
+  [[ "$status" == "managed" ]] || return 0
 
   if [[ "$profile" == "default" ]]; then
-    hermes plugins disable "$plugin_name"
+    if ! HERMES_HOME="$profile_home" hermes --profile default plugins disable "$plugin_name"; then
+      printf 'Could not disable observer for Hermes profile: %s\n' "$profile" >&2
+      return 1
+    fi
   else
-    hermes -p "$profile" plugins disable "$plugin_name"
+    if ! HERMES_HOME="$profile_home" hermes -p "$profile" plugins disable "$plugin_name"; then
+      printf 'Could not disable observer for Hermes profile: %s\n' "$profile" >&2
+      return 1
+    fi
   fi
-  if [[ "$result" == "removed" ]]; then
-    printf 'Disabled observer for Hermes profile: %s\n' "$profile"
+  if ! result="$(python3 "$script_dir/profile_installer.py" remove-profile-link "$profile_home" "$observer_source")"; then
+    printf 'Could not remove observer link for Hermes profile: %s\n' "$profile" >&2
+    return 1
   fi
+  if [[ "$result" == "unrelated" ]]; then
+    printf 'Observer path changed after disable and was left untouched: %s\n' "$profile_home/plugins/$plugin_name" >&2
+    return 0
+  fi
+  [[ "$result" == "removed" || "$result" == "absent" ]] || return 1
+  printf 'Disabled observer for Hermes profile: %s\n' "$profile"
 }
 
+remove_failures=0
 if [[ -d "$hermes_root" ]]; then
-  remove_for_profile default "$hermes_root"
+  remove_for_profile default "$hermes_root" || remove_failures=1
 fi
 
 shopt -s nullglob
 for profile_home in "$hermes_root"/profiles/*; do
   [[ -d "$profile_home" && ! -L "$profile_home" ]] || continue
-  remove_for_profile "$(basename -- "$profile_home")" "$profile_home"
+  remove_for_profile "$(basename -- "$profile_home")" "$profile_home" || remove_failures=1
 done
 
+if (( remove_failures )); then
+  printf 'Hermes Watcher observer removal incomplete; managed payload retained for retry.\n' >&2
+  exit 1
+fi
 python3 "$script_dir/profile_installer.py" remove-data "$data_parent"
 printf 'Hermes Watcher observer removal complete. Restart running Hermes processes.\n'

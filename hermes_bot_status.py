@@ -12,6 +12,7 @@ import os
 import re
 import sqlite3
 import stat
+import subprocess
 import threading
 import time
 from contextlib import closing, contextmanager
@@ -25,6 +26,7 @@ from secure_paths import ManagedTree
 TERMINAL_STATES = {"succeeded", "failed", "interrupted", "stale"}
 MAX_CLOCK_SKEW_SEC = 5.0
 MAX_JSON_SAFE_INTEGER = (1 << 53) - 1
+NOTIFICATION_CLAIM_TTL_SEC = 300.0
 _THREAD_LOCK = threading.Lock()
 _SAFE_PROFILE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,79}$")
 _HERMES_PROFILE_ID = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
@@ -116,7 +118,11 @@ def _profile_avatar_url(profile: str, *, hermes_root: Path | None = None) -> str
     return ""
 
 
-def _available_profiles(*, hermes_root: Path | None = None) -> list[dict]:
+def _available_profiles(
+    *,
+    hermes_root: Path | None = None,
+    profile_filter: set[str] | None = None,
+) -> list[dict]:
     """List local Hermes profile IDs without reading profile configuration."""
     base = hermes_root or _configured_hermes_root()
     names = ["default"]
@@ -147,6 +153,9 @@ def _available_profiles(*, hermes_root: Path | None = None) -> list[dict]:
                     continue
     except OSError:
         pass
+
+    if profile_filter:
+        names = [name for name in names if name in profile_filter]
 
     profiles = []
     for name in names:
@@ -532,6 +541,45 @@ def _event_json_paths(root: Path) -> list[Path]:
     return paths
 
 
+def _observer_process_files(root: Path) -> list[tuple[Path, tuple[str, int, str]]]:
+    tree = ManagedTree(root)
+    registrations: list[tuple[Path, tuple[str, int, str]]] = []
+    for profile in tree.list_directories(("processes",)):
+        if not _SAFE_PROFILE.fullmatch(profile):
+            continue
+        for name in tree.list_regular_files(("processes", profile), suffix=".json"):
+            try:
+                value = tree.read_json(("processes", profile, name))
+            except (OSError, ValueError, TypeError):
+                continue
+            if not isinstance(value, dict) or value.get("schemaVersion") != 1:
+                continue
+            writer_pid = value.get("writerPid")
+            process_start = value.get("writerProcessStart")
+            if (
+                value.get("profile") != profile
+                or isinstance(writer_pid, bool)
+                or not isinstance(writer_pid, int)
+                or writer_pid <= 0
+                or not isinstance(process_start, str)
+                or not 0 < len(process_start) <= 64
+                or not process_start.isdigit()
+            ):
+                continue
+            expected = hashlib.sha256(
+                "\0".join((profile, str(writer_pid), process_start)).encode("utf-8")
+            ).hexdigest()
+            if name != f"{expected}.json":
+                continue
+            path = root / "processes" / profile / name
+            registrations.append((path, (profile, writer_pid, process_start)))
+    return registrations
+
+
+def _observer_process_identities(root: Path) -> set[tuple[str, int, str]]:
+    return {identity for _, identity in _observer_process_files(root)}
+
+
 def _read_json(root: Path, path: Path):
     return ManagedTree(root).read_json(path.relative_to(root).parts)
 
@@ -566,21 +614,62 @@ def _atomic_json(path: Path, value: dict) -> None:
     ManagedTree(root).atomic_json(path.relative_to(root).parts, value)
 
 
-def _acknowledged(root: Path) -> set[str]:
+def _consumer_state(root: Path) -> tuple[set[str], dict[str, float]]:
     try:
         value = ManagedTree(root).read_json(("consumer.json",))
     except FileNotFoundError:
-        return set()
+        return set(), {}
     if not isinstance(value, dict) or value.get("schemaVersion") != 1:
         raise ValueError("invalid consumer state")
-    items = value.get("acknowledged")
-    if not isinstance(items, list) or any(not _valid_event_id(item) for item in items):
+    acknowledged = value.get("acknowledged")
+    claimed = value.get("claimed", {})
+    if not isinstance(acknowledged, list) or any(
+        not _valid_event_id(item) for item in acknowledged
+    ):
         raise ValueError("invalid consumer acknowledgements")
-    return set(items)
+    acknowledged_ids = set(acknowledged)
+    if isinstance(claimed, list):
+        if any(not _valid_event_id(item) for item in claimed):
+            raise ValueError("invalid consumer claims")
+        claim_times = {item: 0.0 for item in claimed}
+    elif isinstance(claimed, dict):
+        if any(
+            not _valid_event_id(event_id) or not _finite_number(claimed_at)
+            for event_id, claimed_at in claimed.items()
+        ):
+            raise ValueError("invalid consumer claims")
+        claim_times = {event_id: float(claimed_at) for event_id, claimed_at in claimed.items()}
+    else:
+        raise ValueError("invalid consumer claims")
+    return acknowledged_ids, {
+        event_id: claimed_at
+        for event_id, claimed_at in claim_times.items()
+        if event_id not in acknowledged_ids
+    }
+
+
+def _acknowledged(root: Path) -> set[str]:
+    return _consumer_state(root)[0]
+
+
+def _write_consumer(root: Path, acknowledged: set[str], claimed: dict[str, float]) -> None:
+    _atomic_json(
+        root / "consumer.json",
+        {
+            "schemaVersion": 1,
+            "acknowledged": sorted(acknowledged),
+            "claimed": {
+                event_id: claimed[event_id]
+                for event_id in sorted(claimed)
+                if event_id not in acknowledged
+            },
+        },
+    )
 
 
 def _write_acknowledged(root: Path, event_ids: set[str]) -> None:
-    _atomic_json(root / "consumer.json", {"schemaVersion": 1, "acknowledged": sorted(event_ids)})
+    _, claimed = _consumer_state(root)
+    _write_consumer(root, event_ids, claimed)
 
 
 def initialize(root: Path) -> None:
@@ -589,13 +678,73 @@ def initialize(root: Path) -> None:
         _write_acknowledged(root, _acknowledged(root) | terminal_ids)
 
 
+def repair_consumer(root: Path) -> None:
+    terminal_ids = {
+        str(record["eventId"])
+        for record in _records(root)
+        if record["state"] in TERMINAL_STATES
+    }
+    with _consumer_lock(root):
+        _write_consumer(root, terminal_ids, {})
+
+
+def claim_notification(root: Path, event_id: str, *, now: float | None = None) -> bool:
+    if not _valid_event_id(event_id):
+        raise ValueError("invalid event ID")
+    with _consumer_lock(root):
+        acknowledged, claimed = _consumer_state(root)
+        current = time.time() if now is None else now
+        claimed_at = claimed.get(event_id)
+        claim_age = current - claimed_at if claimed_at is not None else None
+        if event_id in acknowledged or (
+            claim_age is not None and 0 <= claim_age <= NOTIFICATION_CLAIM_TTL_SEC
+        ):
+            return False
+        claimed[event_id] = current
+        _write_consumer(root, acknowledged, claimed)
+        return True
+
+
+def release_notification(root: Path, event_id: str) -> None:
+    if not _valid_event_id(event_id):
+        raise ValueError("invalid event ID")
+    with _consumer_lock(root):
+        acknowledged, claimed = _consumer_state(root)
+        claimed.pop(event_id, None)
+        _write_consumer(root, acknowledged, claimed)
+
+
+def deliver_notification(
+    root: Path,
+    event_id: str,
+    command: list[str],
+    *,
+    run: Callable[..., object] | None = None,
+    timeout_sec: float = 10.0,
+) -> bool | None:
+    if not claim_notification(root, event_id):
+        return None
+    runner = subprocess.run if run is None else run
+    try:
+        result = runner(command, check=False, timeout=max(0.01, timeout_sec))
+    except (OSError, ValueError, subprocess.SubprocessError):
+        release_notification(root, event_id)
+        return False
+    if int(getattr(result, "returncode", 1)) != 0:
+        release_notification(root, event_id)
+        return False
+    acknowledge(root, event_id)
+    return True
+
+
 def acknowledge(root: Path, event_id: str) -> None:
     if not _valid_event_id(event_id):
         raise ValueError("invalid event ID")
     with _consumer_lock(root):
-        acknowledged = _acknowledged(root)
+        acknowledged, claimed = _consumer_state(root)
         acknowledged.add(event_id)
-        _write_acknowledged(root, acknowledged)
+        claimed.pop(event_id, None)
+        _write_consumer(root, acknowledged, claimed)
 
 
 def pending_notifications(
@@ -609,12 +758,18 @@ def pending_notifications(
 ) -> list[dict]:
     current = time.time() if now is None else now
     enabled = {"succeeded", "failed"} if enabled_states is None else enabled_states
-    acknowledged = _acknowledged(root)
+    acknowledged, claimed = _consumer_state(root)
+    active_claims = {
+        event_id
+        for event_id, claimed_at in claimed.items()
+        if 0 <= current - claimed_at <= NOTIFICATION_CLAIM_TTL_SEC
+    }
     return [
         record
         for record in snapshot.get("_notificationCandidates", snapshot.get("recent", []))
         if record.get("state") in enabled
         and record.get("eventId") not in acknowledged
+        and record.get("eventId") not in active_claims
         and float(record.get("durationSec", 0)) >= min_duration_sec
         and current - float(record.get("finishedAt", 0)) <= max_catchup_age_sec
     ]
@@ -646,7 +801,24 @@ def prune(root: Path, *, keep_terminal: int = 100) -> int:
                 pass
     with _consumer_lock(root):
         retained_ids = {str(record["eventId"]) for record in _records(root)}
-        _write_acknowledged(root, _acknowledged(root) & retained_ids)
+        acknowledged, claimed = _consumer_state(root)
+        _write_consumer(
+            root,
+            acknowledged & retained_ids,
+            {
+                event_id: claimed_at
+                for event_id, claimed_at in claimed.items()
+                if event_id in retained_ids
+            },
+        )
+    for path, (_, writer_pid, process_start) in _observer_process_files(root):
+        if _process_alive(writer_pid, process_start):
+            continue
+        try:
+            ManagedTree(root).unlink_regular(path.relative_to(root).parts)
+            deleted += 1
+        except (FileNotFoundError, ValueError, TypeError):
+            pass
     return deleted
 
 
@@ -954,6 +1126,7 @@ def build_snapshot(
     current = time.time() if now is None else now
     alive = _process_alive if process_alive is None else process_alive
     detected_sessions = _discover_hermes_sessions() if online_sessions is None else online_sessions
+    loaded_observers = _observer_process_identities(root)
     if profile_filter:
         detected_sessions = [
             session for session in detected_sessions
@@ -1199,10 +1372,20 @@ def build_snapshot(
                 str(active_row.get("_writerProcessStart", "")),
             )
         session_key = hashlib.sha256("\0".join(session_identity).encode("utf-8")).hexdigest()
+        observer_identity = (
+            profile,
+            int(session["pid"]) if session is not None else int(active_row.get("_writerPid", 0)),
+            str(
+                session["processStart"]
+                if session is not None
+                else active_row.get("_writerProcessStart", "")
+            ),
+        )
         return {
             "sessionKey": session_key,
             "profile": profile,
             "activeTurnCount": int(active_row.get("activeTurnCount", 0)),
+            "observerLoaded": bool(active_row) or observer_identity in loaded_observers,
             "runningForSec": (
                 float(session["runningForSec"])
                 if session is not None
@@ -1260,7 +1443,10 @@ def build_snapshot(
     recent = [record for record in records if record["state"] in TERMINAL_STATES]
     recent.sort(key=lambda record: float(record.get("finishedAt", 0)), reverse=True)
     hermes_root = _configured_hermes_root()
-    available_profiles = _available_profiles(hermes_root=hermes_root)
+    available_profiles = _available_profiles(
+        hermes_root=hermes_root,
+        profile_filter=profile_filter,
+    )
     return {
         "schemaVersion": 1,
         "generatedAt": current,
@@ -1295,6 +1481,11 @@ def main(argv: list[str] | None = None) -> int:
     snapshot_parser.add_argument("--profile-filter", default="")
     acknowledge_parser = subparsers.add_parser("acknowledge")
     acknowledge_parser.add_argument("event_id")
+    deliver_parser = subparsers.add_parser("deliver-notification")
+    deliver_parser.add_argument("event_id")
+    deliver_parser.add_argument("--icon", required=True)
+    deliver_parser.add_argument("--title", required=True)
+    deliver_parser.add_argument("--body", required=True)
     subparsers.add_parser("initialize")
     prune_parser = subparsers.add_parser("prune")
     prune_parser.add_argument("--keep-terminal", type=int, default=100)
@@ -1308,18 +1499,40 @@ def main(argv: list[str] | None = None) -> int:
             stale_grace_sec=max(1, args.stale_grace_sec),
             profile_filter={item.strip() for item in args.profile_filter.split(",") if item.strip()},
         )
-        snapshot["pendingNotifications"] = pending_notifications(
-            root,
-            snapshot,
-            now=args.now,
-            min_duration_sec=max(0, args.min_duration_sec),
-            max_catchup_age_sec=max(0, args.max_catchup_age_sec),
-            enabled_states={item for item in args.notify_states.split(",") if item},
-        )
+        try:
+            snapshot["pendingNotifications"] = pending_notifications(
+                root,
+                snapshot,
+                now=args.now,
+                min_duration_sec=max(0, args.min_duration_sec),
+                max_catchup_age_sec=max(0, args.max_catchup_age_sec),
+                enabled_states={item for item in args.notify_states.split(",") if item},
+            )
+        except (TypeError, ValueError):
+            repair_consumer(root)
+            snapshot["pendingNotifications"] = []
+            snapshot["notificationError"] = "Notification history was repaired"
         snapshot.pop("_notificationCandidates", None)
         print(json.dumps(snapshot, sort_keys=True, separators=(",", ":")))
     elif args.command == "acknowledge":
         acknowledge(root, args.event_id)
+    elif args.command == "deliver-notification":
+        delivered = deliver_notification(
+            root,
+            args.event_id,
+            [
+                "notify-send",
+                "--app-name=Hermes Watcher",
+                "--urgency=normal",
+                f"--icon={args.icon}",
+                args.title,
+                args.body,
+            ],
+        )
+        if delivered is None:
+            return 75
+        if not delivered:
+            return 1
     elif args.command == "initialize":
         initialize(root)
     elif args.command == "prune":

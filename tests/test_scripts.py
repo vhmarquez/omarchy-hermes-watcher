@@ -1,5 +1,6 @@
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -39,8 +40,36 @@ class ProfileScriptTests(unittest.TestCase):
             self.assertFalse((base / "profiles/coder/plugins/omarchy-bot-status").exists())
             self.assertFalse((data_root / "hermes-plugin").exists())
             commands = log.read_text().splitlines()
-            self.assertIn("plugins disable omarchy-bot-status", commands)
+            self.assertIn("--profile default plugins disable omarchy-bot-status", commands)
             self.assertIn("-p coder plugins disable omarchy-bot-status", commands)
+
+    def test_remove_disables_managed_observer_before_unlinking_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base, _, env = self.make_environment(tmp)
+            fake_hermes = Path(tmp) / "bin/hermes"
+            fake_hermes.write_text(
+                "#!/usr/bin/env bash\n"
+                "set -euo pipefail\n"
+                "profile_home=$HERMES_ROOT\n"
+                "if [[ ${1:-} == -p ]]; then profile_home=$HERMES_ROOT/profiles/$2; shift 2; fi\n"
+                "if [[ ${1:-} == plugins && ${2:-} == disable ]]; then\n"
+                "  [[ -L $profile_home/plugins/omarchy-bot-status ]] || exit 42\n"
+                "fi\n"
+            )
+            fake_hermes.chmod(0o755)
+            subprocess.run([str(ROOT / "scripts/setup-profiles")], env=env, check=True)
+
+            result = subprocess.run(
+                [str(ROOT / "scripts/remove-profiles")],
+                text=True,
+                capture_output=True,
+                env=env,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse((base / "plugins/omarchy-bot-status").exists())
+            self.assertFalse((base / "profiles/coder/plugins/omarchy-bot-status").exists())
 
     def test_remove_does_not_disable_an_unrelated_plugin_path(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -76,6 +105,56 @@ class ProfileScriptTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             commands = log.read_text() if log.exists() else ""
             self.assertNotIn("plugins disable omarchy-bot-status", commands)
+
+    def test_remove_continues_other_profiles_when_one_disable_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base, _, env = self.make_environment(tmp)
+            (base / "profiles/broken").mkdir()
+            subprocess.run([str(ROOT / "scripts/setup-profiles")], env=env, check=True)
+            fake_hermes = Path(tmp) / "bin/hermes"
+            fake_hermes.write_text(
+                "#!/usr/bin/env bash\n"
+                "[[ $* != '-p broken plugins disable omarchy-bot-status' ]]\n"
+            )
+            fake_hermes.chmod(0o755)
+
+            result = subprocess.run(
+                [str(ROOT / "scripts/remove-profiles")],
+                text=True,
+                capture_output=True,
+                env=env,
+                check=False,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertTrue((base / "profiles/broken/plugins/omarchy-bot-status").is_symlink())
+            self.assertFalse((base / "profiles/coder/plugins/omarchy-bot-status").exists())
+            self.assertTrue((Path(env["XDG_DATA_HOME"]) / "vhm.hermes-bots").is_dir())
+            self.assertIn("Could not disable observer for Hermes profile: broken", result.stderr)
+
+    def test_remove_retains_payload_when_link_status_helper_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base, _, env = self.make_environment(tmp)
+            subprocess.run([str(ROOT / "scripts/setup-profiles")], env=env, check=True)
+            fake_python = Path(tmp) / "bin/python3"
+            fake_python.write_text(
+                "#!/usr/bin/env bash\n"
+                "if [[ $* == *'profile-link-status'* ]]; then exit 1; fi\n"
+                f"exec {sys.executable!r} \"$@\"\n"
+            )
+            fake_python.chmod(0o755)
+
+            result = subprocess.run(
+                [str(ROOT / "scripts/remove-profiles")],
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertTrue((base / "plugins/omarchy-bot-status").is_symlink())
+            self.assertTrue((Path(env["XDG_DATA_HOME"]) / "vhm.hermes-bots").is_dir())
 
     def make_environment(self, tmp):
         home = Path(tmp) / "home"
@@ -120,6 +199,32 @@ class ProfileScriptTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 124)
             self.assertTrue((base / "plugins/omarchy-bot-status").exists())
 
+    def test_conditional_remove_keeps_observer_when_plugin_state_is_invalid(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base, _, env = self.make_environment(tmp)
+            subprocess.run(
+                [str(ROOT / "scripts/setup-profiles")],
+                env=env,
+                check=True,
+                stdout=subprocess.DEVNULL,
+            )
+            fake_shell = Path(tmp) / "bin/omarchy-shell"
+            fake_shell.write_text("#!/usr/bin/env bash\nprintf '%s\\n' not-json\n")
+            fake_shell.chmod(0o755)
+            remove = Path(env["XDG_DATA_HOME"]) / "vhm.hermes-bots/scripts/remove-profiles"
+
+            result = subprocess.run(
+                [str(remove), "--if-disabled"],
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue((base / "plugins/omarchy-bot-status").exists())
+            self.assertTrue((Path(env["XDG_DATA_HOME"]) / "vhm.hermes-bots").is_dir())
+
     def test_setup_explicitly_denies_builtin_tool_override(self):
         setup = (ROOT / "scripts/setup-profiles").read_text()
         self.assertIn("--no-allow-tool-override", setup)
@@ -142,9 +247,42 @@ class ProfileScriptTests(unittest.TestCase):
             self.assertTrue((installed_observer / "hermes_proc.py").is_file())
             self.assertTrue((installed_observer / "secure_paths.py").is_file())
             commands = log.read_text().splitlines()
-            self.assertIn("plugins enable --no-allow-tool-override omarchy-bot-status", commands)
+            self.assertIn(
+                "--profile default plugins enable --no-allow-tool-override omarchy-bot-status",
+                commands,
+            )
             self.assertIn("-p coder plugins enable --no-allow-tool-override omarchy-bot-status", commands)
             self.assertTrue((Path(env["XDG_STATE_HOME"]) / "omarchy/hermes-bots/consumer.json").exists())
+
+    def test_lifecycle_commands_scope_home_and_explicitly_select_each_profile(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base, log, env = self.make_environment(tmp)
+            fake_hermes = Path(tmp) / "bin/hermes"
+            fake_hermes.write_text(
+                '#!/usr/bin/env bash\nprintf "%s|%s\\n" "${HERMES_HOME:-}" "$*" >> "$HERMES_TEST_LOG"\n'
+            )
+            fake_hermes.chmod(0o755)
+
+            subprocess.run([str(ROOT / "scripts/setup-profiles")], env=env, check=True)
+            subprocess.run([str(ROOT / "scripts/remove-profiles")], env=env, check=True)
+
+            commands = log.read_text().splitlines()
+            self.assertIn(
+                f"{base}|--profile default plugins enable --no-allow-tool-override omarchy-bot-status",
+                commands,
+            )
+            self.assertIn(
+                f"{base / 'profiles/coder'}|-p coder plugins enable --no-allow-tool-override omarchy-bot-status",
+                commands,
+            )
+            self.assertIn(
+                f"{base}|--profile default plugins disable omarchy-bot-status",
+                commands,
+            )
+            self.assertIn(
+                f"{base / 'profiles/coder'}|-p coder plugins disable omarchy-bot-status",
+                commands,
+            )
 
     def test_repeated_setup_does_not_acknowledge_new_completions(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -220,6 +358,61 @@ class ProfileScriptTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertFalse((outside / "plugins/omarchy-bot-status").exists())
             self.assertNotIn("-p linked plugins enable omarchy-bot-status", log.read_text())
+
+    def test_setup_ignores_noncanonical_and_reserved_profile_directories(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base, log, env = self.make_environment(tmp)
+            for profile in ("Upper", "foo.bar", "root", "valid-one"):
+                (base / "profiles" / profile).mkdir()
+
+            result = subprocess.run(
+                [str(ROOT / "scripts/setup-profiles")],
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            commands = log.read_text().splitlines()
+            self.assertIn(
+                "-p valid-one plugins enable --no-allow-tool-override omarchy-bot-status",
+                commands,
+            )
+            for profile in ("Upper", "foo.bar", "root"):
+                self.assertFalse((base / "profiles" / profile / "plugins").exists())
+                self.assertFalse(any(f"-p {profile} " in command for command in commands))
+
+    def test_setup_keeps_valid_profiles_available_when_one_profile_enable_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base, log, env = self.make_environment(tmp)
+            (base / "profiles/broken").mkdir()
+            fake_hermes = Path(tmp) / "bin/hermes"
+            fake_hermes.write_text(
+                "#!/usr/bin/env bash\n"
+                "printf '%s\\n' \"$*\" >> \"$HERMES_TEST_LOG\"\n"
+                "[[ $* != '-p broken '* ]]\n"
+            )
+            fake_hermes.chmod(0o755)
+
+            result = subprocess.run(
+                [str(ROOT / "scripts/setup-profiles")],
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            commands = log.read_text().splitlines()
+            self.assertTrue(any(command.startswith("-p broken ") for command in commands))
+            self.assertTrue(any(command.startswith("-p coder ") for command in commands))
+            self.assertTrue((base / "profiles/coder/plugins/omarchy-bot-status").is_symlink())
+            self.assertIn("Could not enable observer for Hermes profile: broken", result.stderr)
+            self.assertIn(
+                "HERMES_WATCHER_SETUP_FAILED_PROFILES=broken",
+                result.stderr,
+            )
 
     def test_setup_refuses_symlinks_in_nested_managed_data_directories(self):
         for nested in ("hermes-plugin", "scripts"):

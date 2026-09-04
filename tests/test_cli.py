@@ -14,6 +14,91 @@ SCRIPT = ROOT / "hermes_bot_status.py"
 
 
 class CollectorCliTests(unittest.TestCase):
+    def test_deliver_notification_claims_sends_and_acknowledges_atomically(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_root = Path(tmp) / "state/omarchy/hermes-bots"
+            bin_dir = Path(tmp) / "bin"
+            bin_dir.mkdir()
+            notify_log = Path(tmp) / "notify.log"
+            fake_notify = bin_dir / "notify-send"
+            fake_notify.write_text(
+                "#!/usr/bin/env bash\n"
+                "printf '%s\\n' \"$@\" > \"$NOTIFY_LOG\"\n"
+            )
+            fake_notify.chmod(0o755)
+            env = dict(
+                os.environ,
+                XDG_STATE_HOME=str(Path(tmp) / "state"),
+                PATH=f"{bin_dir}:{os.environ['PATH']}",
+                NOTIFY_LOG=str(notify_log),
+            )
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    "deliver-notification",
+                    "event-cli",
+                    "--icon",
+                    "/tmp/icon.svg",
+                    "--title",
+                    "Hermes finished",
+                    "--body",
+                    "coder succeeded",
+                ],
+                text=True,
+                capture_output=True,
+                env=env,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(
+                notify_log.read_text().splitlines(),
+                [
+                    "--app-name=Hermes Watcher",
+                    "--urgency=normal",
+                    "--icon=/tmp/icon.svg",
+                    "Hermes finished",
+                    "coder succeeded",
+                ],
+            )
+            consumer = json.loads((state_root / "consumer.json").read_text())
+            self.assertIn("event-cli", consumer["acknowledged"])
+            self.assertNotIn("event-cli", consumer["claimed"])
+
+    def test_snapshot_repairs_malformed_consumer_without_losing_core_status(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_root = Path(tmp) / "omarchy/hermes-bots"
+            state_root.mkdir(parents=True)
+            (state_root / "consumer.json").write_text("[]")
+            write_record(
+                state_root,
+                "coder",
+                "done",
+                state="succeeded",
+                startedAt=1.0,
+                finishedAt=10.0,
+                durationSec=9.0,
+            )
+            env = dict(os.environ, XDG_STATE_HOME=tmp)
+
+            result = subprocess.run(
+                [sys.executable, str(SCRIPT), "snapshot", "--now", "11"],
+                text=True,
+                capture_output=True,
+                env=env,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            data = json.loads(result.stdout)
+            self.assertEqual(data["recent"][0]["eventId"], "done")
+            self.assertEqual(data["pendingNotifications"], [])
+            self.assertEqual(data["notificationError"], "Notification history was repaired")
+            consumer = json.loads((state_root / "consumer.json").read_text())
+            self.assertIn("done", consumer["acknowledged"])
+
     def test_snapshot_fails_when_managed_state_anchor_is_unsafe(self):
         with tempfile.TemporaryDirectory() as tmp:
             state_home = Path(tmp) / "state"

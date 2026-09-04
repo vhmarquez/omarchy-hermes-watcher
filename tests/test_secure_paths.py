@@ -11,6 +11,15 @@ import secure_paths
 
 
 class SecurePathsTests(unittest.TestCase):
+    def test_atomic_json_syncs_file_and_containing_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "managed"
+            tree = secure_paths.ManagedTree(root)
+            with mock.patch.object(secure_paths.os, "fsync", wraps=os.fsync) as fsync:
+                tree.atomic_json(("record.json",), {"value": "durable"})
+
+            self.assertGreaterEqual(fsync.call_count, 2)
+
     def test_atomic_json_retries_short_writes(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "managed"

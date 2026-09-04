@@ -68,6 +68,34 @@ def _event_path(profile: str, event_id: str) -> Path:
     return root / "events" / profile / f"{event_id}.json"
 
 
+def record_observer_loaded() -> None:
+    """Publish a process-scoped handshake so idle state can be trusted."""
+    try:
+        profile = _profile_name()
+        pid = os.getpid()
+        process_start = _process_start(pid)
+        if not process_start:
+            return
+        identity = hashlib.sha256(
+            "\0".join((profile, str(pid), process_start)).encode("utf-8")
+        ).hexdigest()
+        root = _state_root()
+        ManagedTree(root).ensure_directory(("processes", profile))
+        _atomic_json(
+            root / "processes" / profile / f"{identity}.json",
+            {
+                "schemaVersion": SCHEMA_VERSION,
+                "profile": profile,
+                "writerPid": pid,
+                "writerProcessStart": process_start,
+            },
+        )
+    except Exception:
+        logging.getLogger(__name__).warning(
+            "Hermes Watcher could not record observer registration", exc_info=True
+        )
+
+
 def _work_description(value: Any) -> str:
     """Return a short, single-line excerpt of the current user request."""
     if not isinstance(value, str):

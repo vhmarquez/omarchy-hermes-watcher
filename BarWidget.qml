@@ -17,6 +17,8 @@ Panel {
   readonly property int activeBotCount: Number(status.activeBotCount || 0)
   readonly property int onlineBotCount: Number(status.onlineBotCount || 0)
   readonly property string heroStatusText: {
+    if (!root.monitor || !root.monitor.setupReady) return "Preparing Hermes Watcher"
+    if (!root.monitor.hasSnapshot) return "Loading sessions"
     if (activeBotCount > 0)
       return activeBotCount + (activeBotCount === 1 ? " Agent working" : " Agents working")
     if (onlineBotCount > 0)
@@ -140,6 +142,7 @@ Panel {
       root.updateFailureIndicator()
       root.pruneExpandedSessionKeys()
     }
+    function onLaunchSucceeded() { root.close() }
   }
 
   IpcHandler {
@@ -195,7 +198,7 @@ Panel {
       if (buttonCode === Qt.MiddleButton) {
         root.toggleNotifications()
       } else if (buttonCode === Qt.RightButton) {
-        if (root.monitor) root.monitor.refresh()
+        if (root.monitor) root.monitor.refresh(true)
       } else root.toggle()
     }
   }
@@ -225,7 +228,7 @@ Panel {
       }
       onTextKey: function(text) {
         if (text === "r" || text === "R") {
-          if (root.monitor) root.monitor.refresh()
+          if (root.monitor) root.monitor.refresh(true)
         } else if (text === "n" || text === "N") {
           root.toggleNotifications()
         }
@@ -341,7 +344,10 @@ Panel {
         width: parent.width
         textFormat: Text.PlainText
         wrapMode: Text.Wrap
-        text: root.monitor ? root.monitor.lastError : ""
+        text: root.monitor && root.monitor.statusError !== "" && root.monitor.hasSnapshot
+          ? root.monitor.statusError + " · Last updated "
+            + Model.formatRelative(root.monitor.lastSuccessfulSnapshotAt, root.monitor.statusClockSec)
+          : (root.monitor ? root.monitor.lastError : "")
         color: root.urgent
         font.family: root.fontFamily
         font.pixelSize: Style.font.bodySmall
@@ -398,8 +404,7 @@ Panel {
                 hoverEnabled: true
                 cursorShape: Qt.PointingHandCursor
                 onClicked: {
-                  if (root.monitor && root.monitor.launchProfile(String(modelData.profile || "")))
-                    root.close()
+                  if (root.monitor) root.monitor.launchProfile(String(modelData.profile || ""))
                 }
               }
 
@@ -413,23 +418,84 @@ Panel {
         }
       }
 
-      Item {
+      Column {
+        visible: root.monitor && root.monitor.hasSnapshot
+          && (root.status.availableProfiles || []).length === 0
         width: parent.width
-        implicitHeight: agentTabs.implicitHeight
+        spacing: Style.space(2)
 
-        ButtonGroup {
-          id: agentTabs
-          anchors.horizontalCenter: parent.horizontalCenter
-          options: [{ value: "active", label: "Active" },
+        Text {
+          width: parent.width
+          textFormat: Text.PlainText
+          text: "No launchable Hermes profiles"
+          color: root.foreground
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.bodySmall
+          font.bold: true
+        }
+
+        Text {
+          width: parent.width
+          textFormat: Text.PlainText
+          text: "Check Hermes installation and profile setup"
+          color: root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+        }
+      }
+
+      PanelSectionHeader {
+        text: "SESSIONS"
+        foreground: root.foreground
+        fontFamily: root.fontFamily
+      }
+
+      Row {
+        id: agentTabs
+        anchors.left: parent.left
+        spacing: Style.space(18)
+
+        Repeater {
+          model: [{ value: "active", label: "Active" },
             { value: "recent", label: "Recent" }]
-          value: root.agentTab
-          foreground: root.foreground
-          background: Color.background
-          accent: Color.accent
-          fontFamily: root.fontFamily
-          fontSize: Style.font.bodySmall
-          focusable: false
-          onChanged: function(value) { root.selectAgentTab(value) }
+
+          Item {
+            id: sessionTab
+            required property var modelData
+            width: sessionTabLabel.implicitWidth
+            height: sessionTabLabel.implicitHeight + Style.space(6)
+
+            Text {
+              id: sessionTabLabel
+              anchors.left: parent.left
+              anchors.top: parent.top
+              textFormat: Text.PlainText
+              text: String(modelData.label)
+              color: root.agentTab === String(modelData.value) || sessionTabMouse.containsMouse
+                ? root.foreground : root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+            }
+
+            Rectangle {
+              id: sessionTabUnderline
+              anchors.left: parent.left
+              anchors.right: parent.right
+              anchors.bottom: parent.bottom
+              height: Style.space(2)
+              radius: height / 2
+              color: Color.accent
+              visible: root.agentTab === String(modelData.value)
+            }
+
+            MouseArea {
+              id: sessionTabMouse
+              anchors.fill: parent
+              hoverEnabled: true
+              cursorShape: Qt.PointingHandCursor
+              onClicked: root.selectAgentTab(String(modelData.value))
+            }
+          }
         }
       }
 
@@ -447,6 +513,7 @@ Panel {
             readonly property bool descriptionExpanded: root.sessionDescriptionExpanded(sessionKey)
             readonly property real cardPadding: Style.space(8)
             readonly property bool isWorking: Number(modelData.activeTurnCount || 0) > 0
+            readonly property bool observerLoaded: modelData.observerLoaded === true
             readonly property bool hasContext: Number(modelData.contextUsed || 0) > 0
               && Number(modelData.contextMax || 0) > 0
             readonly property real contextFraction: hasContext
@@ -487,8 +554,8 @@ Panel {
               anchors.right: parent.right
               anchors.rightMargin: botCard.cardPadding
               textFormat: Text.PlainText
-              text: modelData.activeTurnCount > 0 ? "󰔟" : "󰖟"
-              color: modelData.activeTurnCount > 0 ? Color.accent : root.dim
+              text: botCard.isWorking ? "󰔟" : (botCard.observerLoaded ? "󰖟" : "󰅙")
+              color: botCard.isWorking ? Color.accent : (botCard.observerLoaded ? root.dim : root.urgent)
               font.family: root.fontFamily
               font.pixelSize: Style.font.body
             }
@@ -538,7 +605,9 @@ Panel {
                   ? String(modelData.workDescription)
                   : (modelData.activeTurnCount > 0
                     ? "Current task unavailable"
-                    : "Idle — awaiting a task")
+                    : (modelData.observerLoaded
+                      ? "Idle — awaiting a task"
+                      : "Activity unavailable — restart Hermes"))
                 color: root.foreground
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
@@ -605,7 +674,45 @@ Panel {
       }
 
       BorderSurface {
-        visible: root.agentTab === "active" && root.onlineBotCount === 0
+        visible: root.monitor && !root.monitor.hasSnapshot
+        width: parent.width
+        height: Style.space(52)
+        radius: Style.cornerRadius
+        color: Style.normalFillFor(root.foreground, Color.accent)
+
+        Column {
+          anchors.centerIn: parent
+          width: parent.width - Style.space(16)
+
+          Text {
+            visible: root.monitor && !root.monitor.setupReady
+            width: parent.width
+            textFormat: Text.PlainText
+            text: "Preparing Hermes Watcher…"
+            color: root.foreground
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.bodySmall
+            font.bold: true
+            horizontalAlignment: Text.AlignHCenter
+          }
+
+          Text {
+            visible: root.monitor && root.monitor.setupReady
+            width: parent.width
+            textFormat: Text.PlainText
+            text: "Loading sessions…"
+            color: root.foreground
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.bodySmall
+            font.bold: true
+            horizontalAlignment: Text.AlignHCenter
+          }
+        }
+      }
+
+      BorderSurface {
+        visible: root.agentTab === "active" && root.monitor
+          && root.monitor.hasSnapshot && root.onlineBotCount === 0
         width: parent.width
         height: Style.space(52)
         radius: Style.cornerRadius
@@ -771,9 +878,8 @@ Panel {
               anchors.fill: parent
               cursorShape: Qt.PointingHandCursor
               onClicked: {
-                if (root.monitor
-                    && root.monitor.resumeSession(String(modelData.profile || ""), String(modelData.sessionId || "")))
-                  root.close()
+                if (root.monitor)
+                  root.monitor.resumeSession(String(modelData.profile || ""), String(modelData.sessionId || ""))
               }
             }
           }

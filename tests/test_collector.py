@@ -1,10 +1,12 @@
 import importlib.util
+import hashlib
 import json
 import os
 import sqlite3
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from contextlib import closing, contextmanager
 from pathlib import Path
@@ -622,6 +624,57 @@ class CollectorTests(unittest.TestCase):
             self.assertTrue(snapshot["availableProfiles"][0]["avatarUrl"].startswith(default_avatar.as_uri()))
             self.assertTrue(snapshot["availableProfiles"][1]["avatarUrl"].startswith(coder_avatar.as_uri()))
 
+    def test_snapshot_profile_filter_precedes_avatar_and_recent_session_projection(self):
+        collector = load_collector()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "state"
+            hermes_root = Path(tmp) / "hermes"
+            for profile in ("coder", "researcher"):
+                (hermes_root / "profiles" / profile).mkdir(parents=True)
+            avatar_reads = []
+            session_reads = []
+
+            def avatar_url(profile, **_kwargs):
+                avatar_reads.append(profile)
+                return f"file:///{profile}.png"
+
+            def recent_sessions(profile, **_kwargs):
+                session_reads.append(profile)
+                return [
+                    {
+                        "profile": profile,
+                        "sessionId": f"{profile}-session",
+                        "description": f"{profile} session",
+                        "source": "cli",
+                        "recentAt": 1.0,
+                        "_startedAt": 1.0,
+                    }
+                ]
+
+            with (
+                mock.patch.dict(os.environ, {"HERMES_ROOT": str(hermes_root)}),
+                mock.patch.object(collector, "_profile_avatar_url", side_effect=avatar_url),
+                mock.patch.object(
+                    collector, "_profile_recent_sessions", side_effect=recent_sessions
+                ),
+            ):
+                snapshot = collector.build_snapshot(
+                    root,
+                    now=100.0,
+                    profile_filter={"coder"},
+                    online_sessions=[],
+                )
+
+            self.assertEqual(snapshot["availableProfiles"], [
+                {"profile": "coder", "avatarUrl": "file:///coder.png"}
+            ])
+            self.assertEqual(avatar_reads, ["coder"])
+            self.assertEqual(session_reads, ["coder"])
+            self.assertEqual(
+                [row["profile"] for row in snapshot["recentSessions"]],
+                ["coder"],
+            )
+
     def test_available_profiles_ignore_symlinked_profile_directories(self):
         collector = load_collector()
         with tempfile.TemporaryDirectory() as tmp:
@@ -1026,7 +1079,46 @@ class CollectorTests(unittest.TestCase):
                 [50.0, 20.0, 90.0],
             )
             self.assertTrue(all(row["activeTurnCount"] == 0 for row in snapshot["onlineProfiles"]))
+            self.assertTrue(all(row["observerLoaded"] is False for row in snapshot["onlineProfiles"]))
             self.assertTrue(all("sessionCount" not in row for row in snapshot["onlineProfiles"]))
+
+    def test_snapshot_marks_a_matching_observer_process_handshake_as_loaded(self):
+        collector = load_collector()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            profile = "coder"
+            pid = 11
+            process_start = "110"
+            identity = hashlib.sha256(
+                "\0".join((profile, str(pid), process_start)).encode("utf-8")
+            ).hexdigest()
+            directory = root / "processes" / profile
+            directory.mkdir(parents=True)
+            (directory / f"{identity}.json").write_text(
+                json.dumps(
+                    {
+                        "schemaVersion": 1,
+                        "profile": profile,
+                        "writerPid": pid,
+                        "writerProcessStart": process_start,
+                    }
+                )
+            )
+
+            snapshot = collector.build_snapshot(
+                root,
+                now=100.0,
+                online_sessions=[
+                    {
+                        "profile": profile,
+                        "pid": pid,
+                        "processStart": process_start,
+                        "runningForSec": 50.0,
+                    }
+                ],
+            )
+
+            self.assertIs(snapshot["onlineProfiles"][0]["observerLoaded"], True)
 
     def test_online_session_key_is_stable_across_poll_updates_and_hides_process_identity(self):
         collector = load_collector()
@@ -1493,6 +1585,39 @@ class CollectorTests(unittest.TestCase):
             self.assertNotIn("contextMax", profile)
             self.assertNotIn("contextPercent", profile)
 
+    def test_prune_removes_dead_observer_process_handshakes(self):
+        collector = load_collector()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "state"
+            process_dir = root / "processes/default"
+            process_dir.mkdir(parents=True)
+
+            paths = {}
+            for pid in (10, 11):
+                process_start = str(pid * 10)
+                digest = hashlib.sha256(
+                    f"default\0{pid}\0{process_start}".encode()
+                ).hexdigest()
+                path = process_dir / f"{digest}.json"
+                path.write_text(json.dumps({
+                    "schemaVersion": 1,
+                    "profile": "default",
+                    "writerPid": pid,
+                    "writerProcessStart": process_start,
+                    "registeredAt": 100.0,
+                }))
+                paths[pid] = path
+
+            with mock.patch.object(
+                collector,
+                "_process_alive",
+                side_effect=lambda pid, _start: pid == 11,
+            ):
+                collector.prune(root)
+
+            self.assertFalse(paths[10].exists())
+            self.assertTrue(paths[11].exists())
+
     def test_prune_removes_only_old_terminal_records(self):
         collector = load_collector()
         with tempfile.TemporaryDirectory() as tmp:
@@ -1678,6 +1803,126 @@ class CollectorTests(unittest.TestCase):
 
             collector.acknowledge(root, "new")
             self.assertEqual(collector.pending_notifications(root, snapshot, now=60.0), [])
+
+    def test_notification_claim_prevents_replay_after_service_restart(self):
+        collector = load_collector()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            collector.initialize(root)
+            write_record(
+                root, "coder", "claimed", state="succeeded",
+                startedAt=30.0, updatedAt=40.0, finishedAt=40.0, durationSec=10.0,
+            )
+            snapshot = collector.build_snapshot(root, now=60.0, process_alive=lambda *_: True)
+            self.assertEqual(
+                [item["eventId"] for item in collector.pending_notifications(root, snapshot, now=60.0)],
+                ["claimed"],
+            )
+
+            self.assertTrue(collector.claim_notification(root, "claimed", now=60.0))
+
+            restarted_collector = load_collector()
+            self.assertEqual(
+                restarted_collector.pending_notifications(root, snapshot, now=60.0),
+                [],
+            )
+            self.assertFalse(
+                restarted_collector.claim_notification(root, "claimed", now=60.0)
+            )
+
+    def test_existing_notification_claim_is_not_mistaken_for_delivery(self):
+        collector = load_collector()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            collector.initialize(root)
+            self.assertTrue(collector.claim_notification(root, "still-running"))
+            runner = mock.Mock(return_value=mock.Mock(returncode=0))
+
+            delivered = collector.deliver_notification(
+                root,
+                "still-running",
+                ["notify-send", "title", "body"],
+                run=runner,
+            )
+
+            self.assertIsNone(delivered)
+            self.assertNotIn("still-running", collector._acknowledged(root))
+            runner.assert_not_called()
+
+    def test_stale_notification_claim_can_be_retried(self):
+        collector = load_collector()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            collector.initialize(root)
+
+            self.assertTrue(collector.claim_notification(root, "stale-claim", now=100.0))
+            self.assertFalse(collector.claim_notification(root, "stale-claim", now=399.0))
+            self.assertTrue(collector.claim_notification(root, "stale-claim", now=401.0))
+
+    def test_future_notification_claim_does_not_block_recovery_after_clock_rollback(self):
+        collector = load_collector()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            collector.initialize(root)
+
+            self.assertTrue(collector.claim_notification(root, "future-claim", now=500.0))
+            self.assertTrue(collector.claim_notification(root, "future-claim", now=100.0))
+
+    def test_notification_delivery_acknowledges_before_reporting_success(self):
+        collector = load_collector()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            collector.initialize(root)
+            runner = mock.Mock(return_value=mock.Mock(returncode=0))
+
+            delivered = collector.deliver_notification(
+                root,
+                "event-delivered",
+                ["notify-send", "title", "body"],
+                run=runner,
+            )
+
+            self.assertTrue(delivered)
+            self.assertIn("event-delivered", load_collector()._acknowledged(root))
+            self.assertNotIn("event-delivered", load_collector()._consumer_state(root)[1])
+            runner.assert_called_once()
+
+    def test_failed_notification_delivery_releases_its_persistent_claim(self):
+        collector = load_collector()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            collector.initialize(root)
+            runner = mock.Mock(return_value=mock.Mock(returncode=1))
+
+            delivered = collector.deliver_notification(
+                root,
+                "event-retry",
+                ["notify-send", "title", "body"],
+                run=runner,
+            )
+
+            self.assertFalse(delivered)
+            self.assertNotIn("event-retry", collector._acknowledged(root))
+            self.assertNotIn("event-retry", collector._consumer_state(root)[1])
+            self.assertTrue(collector.claim_notification(root, "event-retry"))
+
+    def test_hung_notification_process_is_terminated_and_released_for_retry(self):
+        collector = load_collector()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            collector.initialize(root)
+            started = time.monotonic()
+
+            delivered = collector.deliver_notification(
+                root,
+                "event-timeout",
+                [sys.executable, "-c", "import time; time.sleep(5)"],
+                timeout_sec=0.05,
+            )
+
+            self.assertFalse(delivered)
+            self.assertLess(time.monotonic() - started, 1.0)
+            self.assertTrue(collector.claim_notification(root, "event-timeout"))
 
     def test_malformed_consumer_state_fails_closed(self):
         collector = load_collector()

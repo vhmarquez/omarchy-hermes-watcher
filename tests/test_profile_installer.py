@@ -16,6 +16,31 @@ SPEC.loader.exec_module(profile_installer)
 
 
 class ProfileInstallerRaceTests(unittest.TestCase):
+    def test_install_data_removes_expected_python_bytecode_during_update(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data_parent = Path(tmp) / "data"
+            profile_installer.install_data(data_parent, ROOT)
+            cache = data_parent / "vhm.hermes-bots/hermes-plugin/__pycache__"
+            cache.mkdir()
+            (cache / "omarchy_bot_status.cpython-314.pyc").write_bytes(b"bytecode")
+
+            profile_installer.install_data(data_parent, ROOT)
+
+            self.assertFalse(cache.exists())
+
+    def test_remove_data_deletes_expected_python_bytecode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data_parent = Path(tmp) / "data"
+            observer = profile_installer.install_data(data_parent, ROOT)
+            cache = observer / "__pycache__"
+            cache.mkdir()
+            for module in ("__init__", "omarchy_bot_status", "hermes_proc", "secure_paths"):
+                (cache / f"{module}.cpython-311.pyc").write_bytes(b"bytecode")
+
+            profile_installer.remove_data(data_parent)
+
+            self.assertFalse((data_parent / "vhm.hermes-bots").exists())
+
     def test_directory_swap_before_atomic_replace_cannot_modify_victim(self):
         with tempfile.TemporaryDirectory() as tmp:
             data_parent = Path(tmp) / "data"

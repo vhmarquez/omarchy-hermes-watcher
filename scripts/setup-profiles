@@ -6,6 +6,7 @@ plugin_root="$(cd -- "$script_dir/.." && pwd -P)"
 hermes_root="${HERMES_ROOT:-$HOME/.hermes}"
 data_parent="${XDG_DATA_HOME:-$HOME/.local/share}"
 plugin_name="omarchy-bot-status"
+reserved_profiles=" hermes test tmp root sudo "
 
 lock_path="${XDG_RUNTIME_DIR:-/tmp}/vhm-hermes-bots-${UID}.lock"
 [[ ! -L "$lock_path" && ( ! -e "$lock_path" || -f "$lock_path" ) ]] || {
@@ -35,30 +36,50 @@ data_root="${observer_source%/hermes-plugin}"
 install_for_profile() {
   local profile="$1"
   local profile_home="$2"
-  [[ "$profile" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,79}$ ]] || {
-    printf 'Ignoring unsafe Hermes profile name: %s\n' "$profile" >&2
+  [[ "$profile" == "default" || ( "$profile" =~ ^[a-z0-9][a-z0-9_-]{0,63}$
+    && "$reserved_profiles" != *" $profile "* ) ]] || {
+    printf 'Ignoring noncanonical Hermes profile name: %s\n' "$profile" >&2
     return 0
   }
-  python3 "$installer" install-profile-link "$profile_home" "$observer_source" >/dev/null
+  if ! python3 "$installer" install-profile-link "$profile_home" "$observer_source" >/dev/null; then
+    printf 'Could not install observer for Hermes profile: %s\n' "$profile" >&2
+    return 1
+  fi
 
   if [[ "$profile" == "default" ]]; then
-    hermes plugins enable --no-allow-tool-override "$plugin_name"
+    if ! HERMES_HOME="$profile_home" hermes --profile default plugins enable --no-allow-tool-override "$plugin_name"; then
+      printf 'Could not enable observer for Hermes profile: %s\n' "$profile" >&2
+      return 1
+    fi
   else
-    hermes -p "$profile" plugins enable --no-allow-tool-override "$plugin_name"
+    if ! HERMES_HOME="$profile_home" hermes -p "$profile" plugins enable --no-allow-tool-override "$plugin_name"; then
+      printf 'Could not enable observer for Hermes profile: %s\n' "$profile" >&2
+      return 1
+    fi
   fi
   printf 'Enabled observer for Hermes profile: %s\n' "$profile"
 }
 
-install_for_profile default "$hermes_root"
+failed_profiles=()
+if ! install_for_profile default "$hermes_root"; then
+  failed_profiles+=(default)
+fi
 
 shopt -s nullglob
 for profile_home in "$hermes_root"/profiles/*; do
   [[ -d "$profile_home" && ! -L "$profile_home" ]] || continue
-  install_for_profile "$(basename -- "$profile_home")" "$profile_home"
+  profile="$(basename -- "$profile_home")"
+  if ! install_for_profile "$profile" "$profile_home"; then
+    failed_profiles+=("$profile")
+  fi
 done
 
 if ! python3 "$installer" is-initialized "$data_parent"; then
   python3 "$plugin_root/hermes_bot_status.py" initialize
   python3 "$installer" mark-initialized "$data_parent"
+fi
+if (( ${#failed_profiles[@]} )); then
+  printf 'Hermes Watcher setup completed with profile warnings; reconciliation will retry.\n' >&2
+  (IFS=,; printf 'HERMES_WATCHER_SETUP_FAILED_PROFILES=%s\n' "${failed_profiles[*]}" >&2)
 fi
 printf 'Hermes Watcher observer setup complete. Restart running Hermes processes to load it.\n'
